@@ -17,6 +17,8 @@ audit_*.csv
 thumbs/
 seedlists/seed_atlas.txt
 seedlists/cordillera.txt
+# --- release artifacts (checksums get attached to GitHub Releases) ---
+SHA256SUMS.txt
 
 # --- viz regenerables ---
 viz/cache/

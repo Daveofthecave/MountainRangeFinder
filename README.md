@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/Linux-FCC624?style=plastic&logo=data:image/svg%2bxml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KCjwhLS0gTGludXggU1ZHIC0tPgo8c3ZnIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIKYXJpYS1sYWJlbD0iTGludXgiIHJvbGU9ImltZyIKdmlld0JveD0iMCAwIDUxMiA1MTIiIGZpbGw9IiMwMDAwMDAiPgoKPGcgdHJhbnNmb3JtPSJtYXRyaXgoMi42NSAwIDAgMi42NSAyNTYgMjc2KSI+Cgo8cGF0aCBkPSJNLTMyLTI1Yy0zIDctMjQgMjktMjIgNTEgOCA5MiAzNiAzMCA3OCA1MyAwIDAgNzUtNDIgMTUtMTEwLTE3LTI0LTItNDMtMTMtNTlzLTMwLTE3LTQ0LTIgNiAzNy0xNCA2NyIvPgoKPHBhdGggZD0iTTQyIDIxczktMTgtOC0zMWMxNiAxNyA2IDMyIDYgMzJoLTNDMzYtMTMgMjcgNiAxNC01NiAyOS03MyAwLTg4IDAtNjBoLTljMS0yNC0yMC0xMi04IDUtMSAzNy0yMyA1Mi0yMyA3OC03LTE4IDYtMzIgNi0zMnMtMTggMTUtNyAzNyAzMSAxNyAxNyAyN2MyMiAxNSA1NiA1IDU1LTI3IDEtOCAyMi01IDI0LTNzLTMtNC0xMy00bS01Ni03OGMtNy0yLTUtMTEtMi0xMXM4IDcgMiAxMW0xOSAxYy01LTctMS0xNCA0LTEzczUgMTMtNCAxMyIgZmlsbD0iI2ZmZiIvPgoKPGcgZmlsbD0iI2U5YzEzMiIgc3Ryb2tlPSIjMzMzIiBzdHJva2Utd2lkdGg9IjEiPgoKPHBhdGggZD0iTS00MSAzMWwyMSAzMGMxMSA3IDUgMzUtMjUgMjEtMTctNS0zMS00LTMzLTEzczQtMTAgMy0xNGMtNC0yMiAxNC0xMSAxOS0yMnM1LTE2IDE1LTJNNzEgNDVjLTQtNiAwLTE3LTE0LTE2LTYgMTItMjMgMjQtMjQgMC0xMCAwLTMgMjQtNyAzNS05IDI3IDE3IDI5IDI4IDE2bDI2LTE4YzItMyA1LTYtOS0xN20tOTItOTJjLTMtNiAxMS0xNCAxNi0xNHMxMiA0IDE5IDYgNCA5IDIgMTBTMy0zNS01LTM1cy0xMC04LTE2LTEyIi8+Cgo8cGF0aCBkPSJNLTIxLTQ4YzggNiAxNyAxMSAzNS0zIi8+Cgo8L2c+Cgo8cGF0aCBkPSJNLTEwLTU0Yy0yIDAgMS0yIDItMW03IDFjMS0xLTEtMi0zLTEiLz4KCjwvZz4KCjwvc3ZnPg==&logoColor=black" alt="Linux" style="vertical-align: middle;">
     <img src="https://img.shields.io/badge/Windows-0078D6?style=plastic&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+CiAgICA8Zz4KICAgICAgICA8cGF0aCBmaWxsPSJub25lIiBkPSJNMCAwSDI0VjI0SDB6Ii8+CiAgICAgICAgPHBhdGggZD0iTTMgNS40NzlsNy4zNzctMS4wMTZ2Ny4xMjdIM1Y1LjQ4em0wIDEzLjA0Mmw3LjM3NyAxLjAxN3YtNy4wNEgzdjYuMDIzem04LjE4OCAxLjEyNUwyMSAyMXYtOC41MDJoLTkuODEydjcuMTQ4em0wLTE1LjI5MnY3LjIzNkgyMVYzbC05LjgxMiAxLjM1NHoiIGZpbGw9IiNmZmZmZmYiLz4KICAgIDwvZz4KPC9zdmc+&logoColor=white" alt="Windows" style="vertical-align: middle;">
     <img src="https://img.shields.io/badge/CUDA-sm__80%2B-76B900?style=plastic" alt="CUDA sm_80+" style="vertical-align: middle;">
-    <img src="https://img.shields.io/badge/Minecraft-1.18--1.21.4-62B47A?style=plastic&color=64b128" alt="Minecraft Java 1.18 through 1.21.4" style="vertical-align: middle;">
+    <img src="https://img.shields.io/badge/Minecraft-1.18--1.21.3-62B47A?style=plastic&color=64b128" alt="Minecraft Java 1.18 through 1.21.4" style="vertical-align: middle;">
     <img src="https://aschey.tech/tokei/github/Daveofthecave/MountainRangeFinder?category=lines&style=plastic&color=64b128" alt="total lines" style="vertical-align:middle;">
     <img src="https://aschey.tech/tokei/github/Daveofthecave/MountainRangeFinder?category=files&style=plastic&color=64b128" alt="files" style="vertical-align:middle;">
     <img src="https://img.shields.io/github/repo-size/Daveofthecave/MountainRangeFinder?style=plastic&color=64b128" alt="repo size" style="vertical-align:middle;">
@@ -110,8 +110,8 @@ Each verified seed is ranked using a custom-built, configurable scoring system t
 4. To terminate the search, press `CTRL+C` on your keyboard.
 5. To review the seeds MRF found, you can always eyeball them in [Cubiomes Viewer](https://github.com/Cubitect/cubiomes-viewer) (CV). Use [this](#copy-to-clipboard) command to copy the sorted seedlist to your clipboard, after which you can paste it (`CTRL+V`) into CV. Then you can download this complementary [.session](Cubiomes_Viewer_MountainRangeFinder_seed_verifier_v3.session) file from this repository (tested on CV 4.1.x), load it into CV, click on the `Locations` tab (under the `Search` tab), click the `Analyze` button, expand the dropdown under the seed you want to review, and click on `Spiral Iterator` to automatically reposition the map to the approximate coordinates where the mountainous megaregion lives. (The video clip below guides you through this process:)
 
+<p align="center">https://github.com/user-attachments/assets/e9f956ef-f9ef-4860-a670-06146788da9e</p>
 
-![ ](viz/etc/MRF_CV_usage_showcase.mp4)
 <p align="center" style="color: #aaaaaa;"><i>Examining a region in Cubiomes Viewer</i></p>
 
 
@@ -378,7 +378,7 @@ MountainRangeFinder lets you compile your own executable file from the source fi
 
 
 |What you'll need|
-|-|
+|:-|
 |- A C/C++ compiler toolchain (`gcc`, `g++`, `make`)|
 |- The **NVIDIA CUDA Toolkit** (for `nvcc`; anything from the last few years is fine)|
 |- **CMake** 3.24 or newer (required on Windows; a nice-to-have on Linux)|
@@ -594,7 +594,7 @@ Mostly, with one caveat. Java and Bedrock have shared biome placement since 1.18
 <details>
 <summary><b>Which Minecraft versions does it support?</b></summary>
 
-The default is 1.21.3, and `--mc` accepts anything from 1.18 through 1.21.4 (eg. `--mc 1.19.4`; for the Winter Drop, use `--mc "1.21 WD"`). The climate fields that decide where temperate mountains form (Erosion, Continentalness, Temperature, Weirdness) have been computed the same way ever since 1.18, so a megaregion's location holds across the whole range; the GPU filters on exactly those fields.
+The default is 1.21.3, and `--mc` accepts anything from 1.18 through 1.21.3 (eg. `--mc 1.19.4`; or, for the Winter Drop that added the Pale Garden, use `--mc "1.21 WD"`). The climate fields that decide where temperate mountains form (Erosion, Continentalness, Temperature, Weirdness) have been computed the same way ever since 1.18, so a megaregion's location holds across the whole range; the GPU filters on exactly those fields.
 
 The biome mix and the score are a slightly different story, because Mojang occasionally retunes the biome table (the Pale Garden, for instance, moved into part of dark forest's climate niche in version 1.21.4). The CPU's biome checks and the scoring system use the biome trees bundled in [cubiomes/](/cubiomes), and the newest bundled tree covers the Winter Drop, Pale Garden included. Anything newer starts working once [upstream cubiomes](https://github.com/Cubitect/cubiomes) grows the matching biome trees and the copy here gets updated; if `--mc` doesn't recognize a version string, that version is newer than the bundled cubiomes.
 
@@ -762,7 +762,7 @@ But notice that if we isolate the added terms, the earlier numbers give us a far
 
 The example I gave above assumes that all octaves contribute their full value to the final sum. But in reality, every octave comes with an **amplitude**: a number that multiplies _how much_ that octave contributes to the final sum. It's as if each term in our running total got its own coefficient:
 
-$\displaystyle {{\color{#16C60C}\mathbf{1}} \!\times\! 1000} \;+\; {{\color{#16C60C}\mathbf{1}} \!\times\! 200} \;+\; {{\color{#E74856}\mathbf{0}} \!\times\! 30} \;+\; {{\color{#16C60C}\mathbf{1}} \!\times\! 4} \;=\; 1204$
+$\displaystyle {\color{#16C60C}\mathbf{1}} \times 1000 \enspace + \enspace {\color{#16C60C}\mathbf{1}} \times 200 \enspace + \enspace {\color{#E74856}\mathbf{0}} \times 30 \enspace + \enspace {\color{#16C60C}\mathbf{1}} \times 4 \enspace = \enspace 1204$
 
 Here, the `30` term has an amplitude of ${\color{#E74856}\mathbf{0}}$, which cancels its contribution entirely. And when Minecraft's generation system sees an octave with amplitude 0, it completely skips over it, rather than wasting time calculating something that wouldn't change the final outcome.
 
