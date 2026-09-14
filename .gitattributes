@@ -1,0 +1,13 @@
+* text=auto
+
+*.sh        text eol=lf
+*.py        text eol=lf
+Makefile    text eol=lf
+makefile    text eol=lf
+
+*.gif       binary
+*.bmp       binary
+*.npy       binary
+*.webp      binary
+*.mp4       binary
+*.session   binary

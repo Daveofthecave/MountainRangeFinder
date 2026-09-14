@@ -1,0 +1,34 @@
+# --- build artifacts ---
+build/
+mountain_rangefinder
+selftest
+*.o
+viz/libmrfshim.so
+
+# --- search output & corpora (large, machine-specific, regenerable) ---
+output*.txt
+probe_results.txt
+recall_test.txt
+magic_check.txt
+verified*.txt
+labels.csv
+todo.csv
+audit_*.csv
+thumbs/
+seedlists/seed_atlas.txt
+seedlists/cordillera.txt
+
+# --- viz regenerables ---
+viz/cache/
+# NOTE: viz/out/*.gif ARE committed -- the README embeds them.
+
+# --- python ---
+__pycache__/
+*.pyc
+
+# --- IDE ---
+.vscode/
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
