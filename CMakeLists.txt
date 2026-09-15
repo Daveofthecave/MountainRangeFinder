@@ -66,7 +66,9 @@ endif()
 if(MRF_STATIC_RUNTIME)
   set_target_properties(mountain_rangefinder PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   if(MSVC)
-    set_target_properties(mountain_rangefinder PROPERTIES
+    # Every target must share one CRT flavor: the static CUDA runtime carries
+    # LIBCMT objects, so /MD objects anywhere in the graph re-trigger LNK4098.
+    set_target_properties(mountain_rangefinder cubiomes PROPERTIES
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   elseif(UNIX)
     target_link_options(mountain_rangefinder PRIVATE -static-libstdc++ -static-libgcc)
@@ -79,6 +81,14 @@ target_include_directories(selftest PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/cubiomes")
 target_link_libraries(selftest PRIVATE cubiomes)
 set_target_properties(selftest PROPERTIES CUDA_ARCHITECTURES "${MRF_ARCHS}")
+
+# selftest links the /MT cubiomes objects, so it needs the same CRT flavor.
+# This lives here (not in the block above) because selftest doesn't exist
+# until this line; set_target_properties requires all targets to be defined.
+if(MRF_STATIC_RUNTIME AND MSVC)
+  set_target_properties(selftest PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 enable_testing()
 add_test(NAME selftest COMMAND selftest)

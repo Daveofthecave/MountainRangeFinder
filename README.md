@@ -12,8 +12,8 @@
     <img src="https://aschey.tech/tokei/github/Daveofthecave/MountainRangeFinder?category=lines&style=plastic&color=64b128" alt="total lines" style="vertical-align:middle;">
     <img src="https://aschey.tech/tokei/github/Daveofthecave/MountainRangeFinder?category=files&style=plastic&color=64b128" alt="files" style="vertical-align:middle;">
     <img src="https://img.shields.io/github/repo-size/Daveofthecave/MountainRangeFinder?style=plastic&color=64b128" alt="repo size" style="vertical-align:middle;">
-    <a href="https://github.com/Daveofthecave/MountainRangeFinder/releases"><img src="https://img.shields.io/github/v/release/Daveofthecave/MountainRangeFinder?style=plastic" alt="release" style="vertical-align:middle;"></a>
     <img src="https://img.shields.io/github/license/Daveofthecave/MountainRangeFinder?style=plastic" alt="license" style="vertical-align:middle;">
+    <a href="https://github.com/Daveofthecave/MountainRangeFinder/releases"><img src="https://img.shields.io/github/v/release/Daveofthecave/MountainRangeFinder?style=plastic&color=390063" alt="release" style="vertical-align:middle;"></a>
 </p>
 
 
@@ -59,7 +59,7 @@ Each verified seed is ranked using a custom-built, configurable scoring system t
 
 ## Quick Start
 
-1. Visit the [Releases](https://github.com/Daveofthecave/MountainRangeFinder/releases) page, and download the Linux binary or the Windows .exe, depending on your operating system. If you want, you can move the file into its own standalone folder.
+1. Visit the [Releases](https://github.com/Daveofthecave/MountainRangeFinder/releases) page, scroll down to the Assets section, and download the Linux binary (`mountain_rangefinder`) or the Windows .exe (`mountain_rangefinder.exe`), depending on your operating system. If you want, you can move the file into its own standalone folder.
 
     <details style="color: #aaaaaa;">
     <summary id="verify-checksum">Optional: How to verify the checksum (click to expand)<br></br></summary>
@@ -108,7 +108,7 @@ Each verified seed is ranked using a custom-built, configurable scoring system t
 
 3. To run a default seedfinding session with MRF, simply type `./mountain_rangefinder` if you're on Linux, or `mountain_rangefinder.exe` if you're using Windows, and the program will start finding mountainous megaregions while writing the results into `output.txt`.
 4. To terminate the search, press `CTRL+C` on your keyboard.
-5. To review the seeds MRF found, you can always eyeball them in [Cubiomes Viewer](https://github.com/Cubitect/cubiomes-viewer) (CV). Use [this](#copy-to-clipboard) command to copy the sorted seedlist to your clipboard, after which you can paste it (`CTRL+V`) into CV. Then you can download this complementary [.session](Cubiomes_Viewer_MountainRangeFinder_seed_verifier_v3.session) file from this repository (tested on CV 4.1.x), load it into CV, click on the `Locations` tab (under the `Search` tab), click the `Analyze` button, expand the dropdown under the seed you want to review, and click on `Spiral Iterator` to automatically reposition the map to the approximate coordinates where the mountainous megaregion lives. (The video clip below guides you through this process:)
+5. To review the seeds MRF found, you can always eyeball them in [Cubiomes Viewer](https://github.com/Cubitect/cubiomes-viewer) (CV). Use [this](#copy-to-clipboard) command to copy the sorted seedlist to your clipboard, after which you can paste it (`CTRL+V`) into CV. Then you can download this complementary [.session](Cubiomes_Viewer_MountainRangeFinder_seed_verifier_v3.session) file from this repository (tested on CV 4.1.x), load it into CV (`CTRL+O`), click on the `Locations` tab (under the `Search` tab), click the `Analyze` button, expand the dropdown under the seed you want to review, and click on `Spiral Iterator` to automatically reposition the map to the approximate coordinates where the mountainous megaregion lives. (The video clip below guides you through this process:)
 
 <p align="center">https://github.com/user-attachments/assets/e9f956ef-f9ef-4860-a670-06146788da9e</p>
 
@@ -139,7 +139,7 @@ The following commands work natively on Linux; if you're on Windows, simply repl
 - To specify the minimum size the mountainous megaregion has to be (i.e. the total area of the low-erosion blob), use the --min-blob-area flag with your desired value. The default is 18 million blocks², assuming --ero-max is set to the default of -0.35. Mountain regions can exceed 25 or 30 million blocks², but those are rarer. If you tighten the --ero-max threshold (eg. by lowering the maximum erosion to -0.45), this will lower the average reported size of the --min-blob-area, so bear that in mind if the flow of candidates suddenly shrinks.
     >`./mountain_rangefinder --min-blob-area 20000000`
 
-- Many mountainous megaregions exist as narrow spaghetti strips winding for many thousands of blocks. If you want to guarantee that a robust mountainous core exists in the megaregion (essentially a circular area within the mountain region that is comprised exclusively of mountainous terrain), you can use the --min-core-width flag to specify the minimum radius of this core. This can help you find large bloblike regions, and filter out the long, thin mountain noodles at the cost of results/hour. Values are multiplied by 64, so if you want a radius of at least 1472, for example, your core radius would be 1472 ÷ 64 = 23. The default is 20.
+- Many mountainous megaregions exist as narrow spaghetti strips winding for many thousands of blocks. If you want to guarantee that a robust mountainous core exists in the megaregion (essentially a circular area within the mountain region that is comprised exclusively of mountainous terrain), you can use the --min-core-width flag to specify the minimum radius of this core. This can help you find large bloblike regions, and filter out the long, thin mountain noodles at the cost of results/hour. Values are multiplied by 64, so if you want a radius of at least 1,472, for example, your core radius would be 1,472 ÷ 64 = 23. The default is 20.
     >`./mountain_rangefinder --min-core-width 23`
 
 - To exclude seeds with low scores (which generally have rather underwhelming mountainous terrain), use the --min-score flag. Generally speaking, ugly regions have a negative score, mediocre regions have a low positive score, and good regions with a lot of tall mountain peaks have a score of 6 or more.
@@ -193,6 +193,12 @@ The following commands work natively on Linux; if you're on Windows, simply repl
 
         `sudo dnf install wl-clipboard`
 
+    - Arch:
+
+        `sudo pacman -S xclip`
+
+        `sudo pacman -S wl-clipboard`
+
     </details>
     <br>
 
@@ -245,7 +251,7 @@ Each verified megaregion gets one row in `output.txt`, appended procedurally whi
 |`edgeClipped`|1 means the blob ran off the CPU's ±48,000-block measurement window, so its area is a lower bound.|
 |`anchorX` / `anchorZ`|The original coordinates where the pipeline first detected this megaregion. `--verify` reproduces the original verdict from these.|
 |`bio*`|Percentages of various biome groups taking up the megaregion: (mountains, old-growth taiga, taiga, meadow, cherry grove, dark forest, plains, rivers, ocean). The number is formatted as a fraction (eg. 0.03 = 3%).|
-|`bw1664*`|Stats of the best 1,664-block mountain-pattern window: `Sc` pattern score, `Dh` steepness, `hStd` height spread, `Hi`/`Lo` high-ground and valley-floor shares, `Mtn` mountain cover, `Dark` dark-forest share.|
+|`bw1664*`|Stats of the best 1,664-block mountain-pattern window: `Sc` = pattern score; `Dh` = steepness; `hStd` = height spread; `Hi`/`Lo` = high-ground and valley-floor shares; `Mtn` = mountain cover; `Dark` = dark-forest share.|
 |`setting`|The scenery bonus (fjords, cliffs, river lakes, oddball biomes nearby), capped at +0.80.|
 
 A few conventions worth knowing:
@@ -266,7 +272,7 @@ A quick heads-up before you dive in: this is a rather advanced procedure. Recali
 
 To recalibrate, follow this procedure:
 
-1. Grab one of your `output.txt` verified seed files after a long run, or combine several of these files into a master file. Make sure the master file has several thousand (or, better yet, tens of thousands of) seeds. The richer the corpus, the more accurate the tuning.
+1. Grab one of your `output.txt` verified seed files after a long run, or combine several of these files into a master file (`consolidate_seedlists.py` is your friend ~ expand "[Can I run two searches at once?](#how-to-consolidate-seedlists)" for a sample command). Make sure the master file has several thousand (or, better yet, tens of thousands of) seeds. The richer the corpus, the more accurate the tuning.
 
 2. Run this command to re-verify the seeds with standardized parameters:
 
@@ -313,6 +319,12 @@ To recalibrate, follow this procedure:
     
         ```sh
         sudo dnf install python3
+        ```
+
+    - Arch:
+
+        ```sh
+        sudo pacman -S python
         ```
 
     If you're on **Windows**, and your Command Prompt window complains, then try replacing `python3` with just `python`.
@@ -647,7 +659,7 @@ Yes. Press Ctrl+C once and wait for the graceful shutdown; the final line tells 
 <dl></dl>
 
 <details>
-<summary><b>Can I run two searches at once?</b></summary>
+<summary id="how-to-consolidate-seedlists"><b>Can I run two searches at once?</b></summary>
 
 Sure, but give each one its own `--output` file; two processes appending to the same file can tangle a row mid-line. Merge them later by dragging them into `seedlists/`, opening up a terminal in that directory, and running `python3 consolidate_seedlists.py . -o combined.txt`.
 </details>
@@ -681,7 +693,15 @@ No, unless a radical new algorithm is discovered that uses some clever tricks to
 <details>
 <summary><b>Why does it need an Nvidia GPU? Does anything work without one?</b></summary>
 
-The search itself is written in CUDA, so it's Nvidia-only for now. Two modes work with no GPU at all: `--verify` (re-score and re-gate an existing seed file) and `--probe` (measure candidates). The entire [recalibration loop](#how-to-recalibrate-the-scoring-system) is CPU-only work, too.
+The search itself is written in CUDA, so it's Nvidia-only for now. Two modes work with no GPU at all: `--verify` (re-score and re-gate an existing seed file) and `--probe` (measure candidates). The entire [recalibration process](#how-to-recalibrate-the-scoring-system) is CPU-only work, too.
+</details>
+
+<dl></dl>
+
+<details>
+<summary><b>What about AMD GPUs or macOS?</b></summary>
+
+Unfortunately incompatible, at least for now, since neither work with CUDA. Supporting AMD would mean rewriting all five GPU kernels (i.e. everything in [`gpu.cu`](/gpu.cu)) against a different compute framework, and modern Macs can't run CUDA at all since Apple dropped Nvidia support years ago, so neither port is currently planned.
 </details>
 
 <dl></dl>

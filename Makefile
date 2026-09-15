@@ -114,7 +114,7 @@ vizshim:
 # dynamic -- build on the oldest distro you intend to support (a container is
 # fine) and the binary will run anywhere newer.
 release: NVCCFLAGS += --cudart static
-release: LDFLAGS += -static-libstdc++ -static-libgcc
+release: LDFLAGS += -Xcompiler "-static-libstdc++ -static-libgcc"
 release: $(TARGET)
 	strip $(TARGET)
 

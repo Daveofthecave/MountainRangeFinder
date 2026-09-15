@@ -11,3 +11,9 @@ makefile    text eol=lf
 *.webp      binary
 *.mp4       binary
 *.session   binary
+
+# cubiomes is vendored third-party code (MIT; see cubiomes/LICENSE).
+# GitHub's programming language overview section (linguist-vendored) 
+# keeps it out of the language stats so the bar reflects MRF's own
+# source files. The files themselves stay browsable and buildable.
+cubiomes/** linguist-vendored
