@@ -465,9 +465,29 @@ MountainRangeFinder lets you compile your own executable file from the source fi
 
         Building on Windows is the scenic route, because `nvcc` insists on using Microsoft's compiler. The good news is that CMake wrangles both compilers for you, so the actual build is two commands. If you're still up for it:
 
-        1. Install [Visual Studio Community 2022](https://aka.ms/vs/17/release/vs_community.exe). In the installer, tick the "Desktop development with C++" workload, and on the right-hand panel make sure "MSVC v143", a Windows SDK, and "C++ CMake tools for Windows" are all checked. (If you'd rather skip installing the entire IDE, the [Build Tools for Visual Studio](https://aka.ms/vs/17/release/vs_buildtools.exe) give you the same compiler.)
+        1. Install [Visual Studio Community 2022](https://aka.ms/vs/17/release/vs_community.exe). In the installer, tick the "Desktop development with C++" workload, and on the right-hand panel make sure "MSVC v143", a Windows SDK, and "C++ CMake tools for Windows" are all checked. (If you'd rather skip installing the entire IDE, the [Build Tools for Visual Studio](https://aka.ms/vs/17/release/vs_buildtools.exe) (~6.7GB) give you the same compiler.)
 
         2. Install the **CUDA Toolkit** (~3.5GB) from [NVIDIA's download page](https://developer.nvidia.com/cuda-downloads): pick Windows, your architecture (usually x86_64), your version, and the "exe (local)" installer. The defaults are fine, and the installer registers CUDA with Visual Studio by itself.
+
+            <details style="color: #aaaaaa;">
+            <summary>Already had the CUDA Toolkit installed before Visual Studio?</summary>
+
+            <dd>
+
+            That registration only reaches the Visual Studio versions that exist *at the moment CUDA is installed*. If your toolkit predates your existing Visual Studio (say, CUDA was already on the machine from an older project), the integration files never made it across, and the `cmake` step fails with `No CUDA toolset found`. Copy them over by hand, from an **administrator** Command Prompt:
+
+            ```cmd
+            copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v<your version>\extras\visual_studio_integration\MSBuildExtensions\*" "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VC\v170\BuildCustomizations\"
+            ```
+
+            (If you installed the Build Tools rather than the full Visual Studio, the destination lives under `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\...` instead. Re-running the CUDA installer's repair does the same job, but the copy is faster.)
+
+            An older toolkit can also clash with a newer MSVC, since nvcc compiles its host code against the Visual Studio standard library, and the newest toolsets refuse it outright: the `cmake` step dies with `error STL1002: Unexpected compiler version, expected CUDA 12.4 or newer` (on some setups, nvcc instead complains about an unsupported Visual Studio version). The remedy is to hand nvcc a compiler from its own era: open the Visual Studio Installer, Modify, Individual Components, tick an older **MSVC v143 build tools** component (eg. v14.35; the oldest offered is the safest), then add `-T version=<that version>` to the `cmake` configure line in step 4 below, so the build actually uses it.
+
+            </dd>
+            </details>
+
+            <p></p>
 
         3. Open the Start Menu and launch "x64 Native Tools Command Prompt for VS 2022". This is a special **Command Prompt** window with the compiler environment pre-loaded; a plain PowerShell window won't know where the `cl.exe` compiler lives. In that prompt, `cd` into the project folder you downloaded/cloned earlier:
 
@@ -637,7 +657,7 @@ Sure, but give each one its own `--output` file; two processes appending to the 
 <details>
 <summary><b>Why is my seeds/second lower than the screenshot?</b></summary>
 
-The ~20M/s figure came from a run on a higher-end desktop GPU/CPU combo; laptop GPUs will be slower, and tightening the climate gates changes the rate too. To see how exactly the pipeline is filtering the seeds, run your search command with the `--debug` flag (or, if you're really curious, `--verbose`). This will show you what proportion of seeds get snagged in each stage, and what proportion make it through.
+The ~20M/s figure came from a run on a higher-end desktop GPU/CPU combo; laptop GPUs will be slower (eg. ~5M/s), and tightening the climate gates changes the rate too. To see how exactly the pipeline is filtering the seeds, run your search command with the `--debug` flag (or, if you're really curious, `--verbose`). This will show you what proportion of seeds get snagged in each stage, and what proportion make it through.
 </details>
 
 <dl></dl>
