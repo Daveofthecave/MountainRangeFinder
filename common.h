@@ -23,7 +23,7 @@
 
 // Program version, printed by --version and the startup banner. Bump this
 // together with the git tag when cutting a release.
-#define MRF_VERSION "1.0.0"
+#define MRF_VERSION "1.0.1"
 
 // ============================================================================
 // Search configuration constants (blocks), mapped from the CV recipe

@@ -12,7 +12,7 @@
 #   -DMRF_FAST_MATH=ON                  add --use_fast_math (run selftest after)
 #   -DMRF_STATIC_RUNTIME=ON             static CUDA/C++ runtimes (release builds)
 
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.20)
 project(MountainRangeFinder LANGUAGES C CXX CUDA)
 
 set(CMAKE_C_STANDARD 11)
