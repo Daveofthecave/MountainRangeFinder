@@ -1072,7 +1072,7 @@ The next stage in the pipeline measures the megaregion and turns those measureme
 
 To do this, MRF uses three sliding windows that scan the megaregion's bounding box to measure various features within each window snapshot, like average peak height and biome distribution. It keeps track of which features aligned most favorably, and remembers where this best-patterned window landed (the green box in the animation below).
 
-The animation only shows the 1664-block sliding window for simplicity, but in reality, MRF slides three windows (measuring 896, 1,664, and 3,200 blocks across, respectively) across the megaregion's bounding box.
+The animation only shows the 1,664-block sliding window for simplicity, but in reality, MRF slides three windows (measuring 896, 1,664, and 3,200 blocks across, respectively) across the megaregion's bounding box.
 
 <p align="center">
   <img src="viz/out/g09_windows.gif">

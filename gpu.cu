@@ -1,49 +1,66 @@
 // gpu.cu
-// GPU pipeline: 2D climate filtering only. All heavy 3D work (surface height,
-// biome checks) is deferred to the CPU verifier threads.
+// The GPU side of the search. Everything here is 2D climate-noise filtering;
+// the expensive 3D work (approximate surface heights, biome lookups) happens
+// later, on the CPU verifier threads, and only for the few seeds that make
+// it through this pipeline.
 //
-//   Stage 1  KernelInit:      seed -> erosion 0A/0B tables (2 per seed), one
-//                             thread per table, Fisher-Yates window staged
-//                             in padded shared memory (wave 6); the other
-//                             32 tables (6 erosion + 18 continentalness + 
-//                             4 temperature + 4 weirdness) are deferred to 
-//                             KernelLateInit, which builds them once per 
-//                             surviving seed instead of for the whole batch -- 
-//                             the init stage drops ~4x
-//   Stage 2  KernelCoverage:  a hexagonal lattice of 399 quart anchors over
-//                             the +-16,000-block area (spacing 1920 blocks;
-//                             the r=1600 core discs overlap). A 7-point
-//                             pre-probe reads a shared probe lattice (anchor
-//                             centers + hex-edge midpoints, each sampled once
-//                             per seed and shared by two anchors), killing
-//                             hopeless anchors with no extra noise math;
-//                             survivors get the fail-fast disc coverage of
-//                             low 0B erosion (recipe step 2) -- this, not a
-//                             point extreme, is what defines a mountain blob
-//   Stage 3  KernelLateInit:  continentalness/temperature tables plus the six
-//                             deferred erosion tables, initialized once per
-//                             surviving seed (deduplicated through
-//                             init_flags); one warp per anchor so the 28
-//                             tables build in parallel across lanes
-//   Stage 4  KernelExtrema:   windowed checks around each surviving anchor,
-//                             cheap-and-selective first: cool temperature
-//                             coverage (6), 1B continentalness coverage (4),
-//                             deep erosion point (3), high continentalness
-//                             point (5)
-//   Stage 5  KernelBlob:      contiguity measurement. One thread block per
-//                             core hit flood-fills the multi-climate field
-//                             (common.h BLOB_*) on a 64-block lattice
-//                             (shared-memory bitmaps) from the core's
-//                             centroid outward, with early exit the moment
-//                             the connected area crosses TARGET_BLOB_CELLS
-//                             (common.h). This proxies the quantity the
-//                             search is about -- megaregion extent -- and the
-//                             CPU re-measures it in double precision with the
-//                             real gate. The first passing core emits at most
-//                             one candidate, capped at PER_SEED_CAP per seed.
+// Some terminology used throughout this file:
 //
-// All kernel coordinates are quart units (quart = block / 4). Conversion to
-// blocks (*4) happens once, at candidate emission in KernelBlob.
+//   * Each climate field (erosion, continentalness, temperature, weirdness)
+//     is a stack of octaves, and every octave has two variants, A and B,
+//     sampled at slightly different frequencies and summed. "0B" means the
+//     stack truncated after octave 0 (only 0A + 0B), "1B" includes octave 1
+//     (0A + 0B + 1A + 1B), and "full" means every octave. Early stages read
+//     mostly truncations, which are much cheaper and accurate enough for
+//     filtering; survivors get the full stacks.
+//   * All kernel coordinates are in quart units (blocks / 4), the resolution
+//     Minecraft itself samples these fields at. Conversion back to blocks
+//     happens exactly once, when a candidate is emitted in KernelBlob.
+//   * A warp is 32 threads executing in lockstep; the __ballot_sync and
+//     __shfl intrinsic family lets a warp exchange values without touching
+//     memory.
+//
+// The stages, in order:
+//
+//   Stage 1  KernelInit:      Builds the two erosion octave-0 tables (0A and
+//                             0B) for a whole batch of seeds, one thread per
+//                             table. Those are the only tables stage 2 reads,
+//                             so each seed's other 32 tables are deferred to
+//                             stage 3, which builds them only for survivors.
+//   Stage 2  KernelCoverage:  Checks a hexagonal lattice of 399 anchor points
+//                             spread over the search square (+-16,000 blocks
+//                             around the origin). Each anchor first gets a
+//                             cheap 7-sample erosion probe; anchors that pass
+//                             get a 96-sample disc scan requiring roughly 80%
+//                             low-erosion coverage. Disc coverage, not any
+//                             single extreme value, is what defines a
+//                             mountain-forming region here.
+//   Stage 3  KernelLateInit:  Builds the remaining 32 noise tables once per
+//                             surviving seed (the rest of erosion, all of
+//                             continentalness and temperature, and the
+//                             truncated weirdness), one warp per anchor with
+//                             the 32 tables spread across the 32 lanes.
+//   Stage 4  KernelExtrema:   Six windowed checks around each surviving
+//                             anchor, cheapest and most selective first:
+//                             temperature coverage, continentalness disc
+//                             coverage, weirdness ridge texture, the erosion
+//                             minimum, the continentalness maximum, and an
+//                             approximate-height gate. Any check can kick out
+//                             the anchor early, so the expensive full-stack
+//                             scans only run on whichever seeds made it
+//                             through all six checks.
+//   Stage 5  KernelBlob:      The megaregion measurement. One thread block
+//                             per surviving anchor flood-fills the connected
+//                             low-erosion, inland, temperate field on a
+//                             64-block lattice out to +-8,000 blocks, with an
+//                             early exit the moment the connected area
+//                             crosses a target size (g_blobcfg.target_cells,
+//                             pushed from main() as 0.88x the CPU gate). The
+//                             GPU works in float32 as a prefilter; the CPU
+//                             re-measures the same field in double precision
+//                             against the real gate. Each passing anchor
+//                             emits one candidate, at most PER_SEED_CAP per
+//                             seed per batch.
 
 #include "random.h"
 #include "noise_common.h"
@@ -67,10 +84,10 @@
 #include <cuda_runtime.h>
 
 
-#define PANIC(...)                                                             \
-  {                                                                            \
-    std::fprintf(stderr, __VA_ARGS__);                                         \
-    std::abort();                                                              \
+#define PANIC(...)                      \
+  {                                     \
+    std::fprintf(stderr, __VA_ARGS__);  \
+    std::abort();                       \
   }
 
 #define TRY_CUDA(expr) try_cuda(expr, __FILE__, __LINE__)
@@ -81,16 +98,17 @@ static void try_cuda(cudaError_t error, const char *file, uint64_t line) {
     PANIC("CUDA error at %s:%" PRIu64 ": %s (%d)\n", file, line, cudaGetErrorString(error), error);
 }
 
-// Print a per-stage timing/funnel table every STATS_INTERVAL batches. At
-// ~18-21M seeds/s, 128 batches is a bit under a second. A final partial table
-// is also printed when the pipeline drains (covers short --seeds runs).
+// A per-stage timing and funnel table is printed every STATS_INTERVAL
+// batches (about a second of work at typical speeds), plus a final partial
+// table when the pipeline drains, so short --seeds runs still get one.
 #ifndef STATS_INTERVAL
 #define STATS_INTERVAL 128
 #endif
 
 // ---------------------------------------------------------------------------
-// Device-side copies of the shared configs (identical expressions to the host
-// copies in noise_common.h -- device and host can never diverge).
+// GPU-side copies of the shared climate configs. They are built from the
+// same expressions as the host copies in noise_common.h, so the GPU and CPU
+// can never disagree about how any octave stack is scaled.
 // ---------------------------------------------------------------------------
 __device__ constexpr ClimateConfig<4> D_EROSION_CFG         = make_climate_config<5, 4>(-9,  EROSION_AMPS,         HASH_EROSION);
 __device__ constexpr ClimateConfig<9> D_CONTINENTALNESS_CFG = make_climate_config<9, 9>(-9,  CONTINENTALNESS_AMPS, HASH_CONTINENTALNESS);
@@ -100,9 +118,12 @@ __device__ constexpr ClimateConfig<3> D_WEIRDNESS_CFG       = make_climate_confi
 __device__ GradDotTable g_grad_dot_table;
 __device__ DiscOffsets  g_disc;
 
-// Runtime blob-field knobs pushed from main() before any worker starts. The
-// float32 GPU prefilter must always be looser than the double-precision CPU
-// gate; the host side enforces the margin (target_cells ~ 0.88 * area / 4096).
+// The blob-field thresholds and the flood fill's early-exit target, pushed to
+// the GPU from main() before any worker thread starts. The GPU measures in
+// float32 as a prefilter and must always be the looser side, so main() sets
+// the target about 12% below the CPU's double-precision area gate
+// (target_cells ~ 0.88 * area / 4096). A borderline region then always
+// reaches the CPU, which has the final say.
 struct DeviceBlobCfg {
     float ero_max, cont_min, temp_min, temp_max;
     uint32_t target_cells;
@@ -131,41 +152,43 @@ static void upload_disc_offsets() {
 }
 
 // ---------------------------------------------------------------------------
-// Climate thresholds, raw noise units (Cubiomes-Viewer display / 10000),
-// grouped by recipe step. These are the tuning knobs -- if the hit rate is
-// too low, relax CORE_COV_ERO_MAX or CORE_ERO_MIN_REQ first.
-// (The blob-fill field thresholds BLOB_* live in common.h, shared with the
-// CPU verifier, so both sides always sample the same field.)
+// Climate thresholds for the core checks, in raw noise units (the values
+// Cubiomes Viewer displays divided by 10,000). If the candidate rate ever
+// drops too low, CORE_COV_ERO_MAX and CORE_ERO_MIN_REQ are the first knobs
+// to relax. The flood fill's own field thresholds (BLOB_*) live in common.h,
+// so the GPU and the CPU verifier always sample the same field.
 // ---------------------------------------------------------------------------
-constexpr float CORE_COV_ERO_MAX  = -0.40f;  // (recipe step 2)  disc coverage, 0B erosion
-constexpr float CORE_ERO_MIN_REQ  = -1.15f;  // (3)  window minimum, full erosion (was -1.20f)
-constexpr float CORE_COV_CONT_MIN =  0.00f;  // (4)  disc coverage, 1B continentalness
-constexpr float CORE_CONT_MAX_REQ =  0.70f;  // (5)  window maximum, full continentalness
+constexpr float CORE_COV_ERO_MAX  = -0.40f;  // disc scan: 0B erosion ceiling
+constexpr float CORE_ERO_MIN_REQ  = -1.15f;  // window scan: full-stack erosion minimum
+constexpr float CORE_COV_CONT_MIN =  0.00f;  // disc scan: 1B continentalness floor (inland)
+constexpr float CORE_CONT_MAX_REQ =  0.70f;  // window scan: full-stack continentalness max
 
-// (6) core cool-temperature window: full-octave temperature,
-// >=65% of the 1000x1000-block window inside [-0.40, +0.20]. Deliberately
-// slightly tighter than the blob field's BLOB_TEMP_* window -- the core has
-// to be solidly temperate even where the periphery relaxes.
+// Core temperature window: at least 65% of a 1000x1000-block window must sit
+// inside [-0.40, +0.20] (full stack). Deliberately a little tighter than the
+// flood fill's temperature limits, so a region's core is solidly temperate
+// even where the periphery is allowed to relax.
 constexpr float CORE_TEMP_MIN     = -0.40f;
 constexpr float CORE_TEMP_MAX     =  0.20f;
 
-// Stage-2 probe (recipe step 2 pre-gate). Each anchor is probed on seven
-// points of the shared hex probe lattice (see KernelCoverage): its own
-// center plus the six hex-edge midpoints at 960 blocks, each sampled once
-// per seed and shared by two anchors. The 0B field is smooth at this scale
-// (wavelengths ~4-8k blocks against a 3.2k-wide disc), so a >= PROBE_NEED
-// of 7 vote below PROBE_GATE predicts an 80%-low-erosion disc well. The
-// midpoints sit inside the r=1600 disc, close to its area-weighted mean
-// radius (2R/3 = 1067 blocks), so this is a better disc predictor than the
-// old 1200-block rim ring, not just a cheaper one.
-// Tuning ladder if the recall run loses seeds: PROBE_NEED 5 -> 4, then
-// PROBE_GATE -0.30 -> -0.25.
+// The stage-2 pre-probe: a cheap vote that decides whether an anchor is
+// worth the 96-sample disc scan at all. Each anchor reads seven shared probe
+// values (see KernelCoverage): its own center plus the six points halfway to
+// its neighbors, 960 blocks out. Octave-0 erosion is smooth at this scale
+// (its features are wider than the 3,200-block disc), so six out of seven
+// samples below PROBE_GATE is a good forecast of the disc passing its ~80%
+// coverage requirement. The gate sits looser than the disc's own -0.40
+// ceiling on purpose: one unlucky sample should not disqualify a borderline
+// area. The midpoints also happen to sit near the disc's area-weighted mean
+// radius (2R/3 ~ 1067 blocks), which makes them better disc predictors than
+// rim points.
+// If a recall run ever loses known-good seeds, loosen in this order:
+// PROBE_NEED to 5, then 4, then PROBE_GATE from -0.30 to -0.25.
 constexpr float PROBE_GATE = -0.30f;
-constexpr int   PROBE_NEED = 6;   // of 7 shared probe points
+constexpr int   PROBE_NEED = 6;   // required hits out of 7 probe points
 
-// The search square stays at +-SEARCH_RADIUS_Q (common.h); the anchor
-// lattice geometry now lives in KernelCoverage (hex lattice). The megaregion
-// size gate (TARGET_BLOB_CELLS) is likewise still from common.h.
+// The search square (+-SEARCH_RADIUS_Q) and the default megaregion size gate
+// (TARGET_BLOB_CELLS) live in common.h; the anchor lattice geometry is in
+// KernelCoverage below.
 
 // ---------------------------------------------------------------------------
 // Buffer utilities
@@ -190,9 +213,9 @@ template <typename T> struct OutputBuffer {
         : data(other.data), len(other.len), max_len(other.max_len) {}
 };
 
-// Note: producers keep incrementing len past max_len on overflow (so the host
-// can detect and warn), and consumers must therefore clamp via size() --
-// reading up to a raw, overflowed len would go out of bounds.
+// Overflow convention: producers keep incrementing len past max_len, so the
+// CPU can detect and warn about a full buffer, and consumers must therefore
+// clamp with size(). Reading up to the raw len would run out of bounds.
 template <typename T> struct InputBuffer {
     const T *data;
     const uint32_t *len;
@@ -207,8 +230,9 @@ template <typename T> struct InputBuffer {
     __device__ uint32_t size() const { return min(*len, max_len); }
 };
 
-// Strided copy of the gradient table into shared memory. Works for ANY block
-// size (the original Bug #2 was an 8-thread block copying only 8 of 48 words).
+// Strided copy of the Perlin gradient table (16 directions x 3 axes) into
+// shared memory. Works for any block size; the 48 words are split across
+// however many threads the block has.
 __device__ inline void load_grad_table_shared(GradDotTable &s_grad) {
     for (uint32_t i = threadIdx.x; i < sizeof(GradDotTable) / sizeof(uint32_t); i += blockDim.x)
         reinterpret_cast<uint32_t *>(&s_grad)[i] =
@@ -224,10 +248,11 @@ __device__ inline void load_noise_shared(ImprovedNoise &dst, const ImprovedNoise
             reinterpret_cast<const uint32_t *>(&src)[i];
 }
 
-// Warp reduction returning the total on every lane (XOR butterfly), so the
-// result can safely drive warp-uniform control flow. (A shfl_down reduction
-// leaves the total on lane 0 only; lanes branching on different partial
-// values around a subsequent __ballot_sync would be undefined behavior.)
+// Sum a value across all 32 lanes of a warp and return the total on every
+// lane (XOR butterfly), so the result can safely drive warp-uniform control
+// flow. A shfl_down reduction would leave the total on lane 0 only, and
+// lanes branching on different partial values around a later __ballot_sync
+// would be undefined behavior.
 __device__ inline uint32_t warp_reduce_add(uint32_t v) {
     v += __shfl_xor_sync(~0u, v, 16);
     v += __shfl_xor_sync(~0u, v, 8);
@@ -237,11 +262,12 @@ __device__ inline uint32_t warp_reduce_add(uint32_t v) {
     return v;
 }
 
-// init_climate_table, but with the Fisher-Yates window staged through a
-// caller-provided 260-byte scratch row (padded shared memory) and a word-wise
-// write-out to global. Same RNG chain, same swap order, same table layout --
-// bit-identical output to init_climate_table, without the local-memory
-// sector serialization or the 256 single-byte global stores.
+// init_climate_table with the shuffled permutation staged through a
+// caller-provided shared-memory scratch row (65 words: 64 of permutation
+// plus one of padding, which keeps concurrent rows on distinct shared-memory
+// banks). The finished table is written to global memory as whole words
+// instead of 256 single-byte stores. The RNG chain and swap order are
+// unchanged, so the result is bit-identical to the plain version.
 template <size_t M>
 __device__ inline void init_table_scratch(ImprovedNoise &out, uint64_t seed,
         const ClimateConfig<M> &cfg, uint32_t i, bool b_side, uint8_t *scratch) {
@@ -270,9 +296,9 @@ __device__ inline void init_table_scratch(ImprovedNoise &out, uint64_t seed,
 }
 
 // ---------------------------------------------------------------------------
-// Per-stage statistics: CUDA events bracket each kernel; after the batch
-// syncs, the deltas and the stage funnel counts accumulate into StageStat
-// rows which print every STATS_INTERVAL batches.
+// Per-stage statistics. CUDA events bracket each kernel launch, and after a
+// batch syncs, the stage timings and funnel counts accumulate into StageStat
+// rows that print every STATS_INTERVAL batches.
 // ---------------------------------------------------------------------------
 struct CudaEvent {
     cudaEvent_t ev = nullptr;
@@ -341,31 +367,36 @@ static void print_stage_stats(int device, uint64_t batches, double wall_s,
 }
 
 // ===========================================================================
-// Stage 1: initialize only the erosion 0A/0B tables for a batch of seeds --
-// the only tables KernelCoverage samples. One thread per table (2 threads per
-// seed). The remaining 28 tables (6 erosion + 18 continentalness +
-// 4 temperature) are built lazily by KernelLateInit for the ~1.5% of seeds
-// that survive coverage, so the vast majority of seeds never pay for them.
-// VRAM: 65536 * 9248 B ~= 578 MiB for the full table array. The array is
-// allocated whole, but only the erosion 0B pair is initialized up front.
+// Stage 1: build the erosion octave-0 tables (0A and 0B) for an entire batch
+// of seeds. These are the only noise tables stage 2 ever reads, so this is
+// all the initialization most seeds will ever get: one thread per table, two
+// threads per seed. The remaining 32 tables per seed (the rest of erosion,
+// continentalness, temperature, and the truncated weirdness pair) are built
+// later by KernelLateInit, and only for the small share of seeds that
+// survive stage 2 (roughly 1.5 surviving anchors per 100 seeds).
+//
+// Memory: the batch array is 131072 seeds * 9248 bytes = 1156 MiB, allocated
+// in full, twice over while double-buffering is active. Only the erosion
+// octave-0 slots are populated here.
 // ===========================================================================
 namespace KernelInit {
-constexpr uint32_t SEEDS_PER_RUN      = 1u << 17; // 131072 seeds/batch (wave 3B)
-constexpr uint32_t TABLES_PER_SEED    = 2;        // erosion a[0] + b[0] up front
+constexpr uint32_t SEEDS_PER_RUN      = 1u << 17; // 131072 seeds per batch
+constexpr uint32_t TABLES_PER_SEED    = 2;        // the two octave-0 tables (0A, 0B)
 constexpr uint32_t THREADS_PER_BLOCK  = 128;      // 1 thread per table -> 128 tables per block
 
-// Shared-memory Fisher-Yates table init (wave 6; replaces the wave-5
-// warp-cooperative variant, which was a wash -- it traded 32x parallelism
-// for shfl exchanges while the 256-step serial chain stayed intact, so the
-// stage never sped up).
-// Diagnosis: local-memory byte swaps were the true cost. Each lane owns a
-// private 256-byte permutation window and the FY loop index is lane-uniform,
-// so the lanes' byte accesses land exactly 256 bytes apart -- a different
-// 128-byte sector per lane, ~32 sectors serialized per warp access. This
-// version stages the window in shared memory with a 1-word pad (65-word
-// stride), which spreads the lanes across all 32 banks, then writes the
-// finished table out as coalesced 4-byte words. Same RNG draws, same swap
-// order: the tables are bit-identical to every previous version.
+// Each permutation table starts as the identity and is shuffled with 256
+// Fisher-Yates steps, every step drawing from that octave's RNG stream. The
+// shuffle is inherently serial, so the win here is in where the window
+// lives. In per-thread local memory the whole warp accesses the same shuffle
+// index at once, and because each window is 256 bytes, those accesses land
+// 256 bytes apart: one distinct 128-byte sector per lane, about 32
+// serialized sector reads per warp access. Staging the window in shared
+// memory with one padding word per row (a 65-word stride) spreads the lanes
+// over all 32 shared-memory banks instead, and the finished table is written
+// out as coalesced 4-byte words. The RNG draws and swap order are untouched,
+// so the tables are bit-identical to the straightforward version. (A
+// warp-cooperative variant that shuffled via lane exchanges measured no
+// faster; the serial RNG chain is the bottleneck either way.)
 __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
         InputBuffer<uint64_t> seeds, MountainNoiseResult *__restrict__ results) {
     constexpr uint32_t STRIDE = 65; // 64 words of permutation + 1 word pad
@@ -420,51 +451,50 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
 } // namespace KernelInit
 
 // ===========================================================================
-// Stage 2: core disc coverage (recipe step 2).
+// Stage 2: core disc coverage.
 //
-// HEXAGONAL ANCHOR LATTICE + SHARED PROBE LATTICE
-//
-// Anchor geometry. The old 21x21 square grid (1600-block step) has a covering
-// radius of 800*sqrt(2) = 1131.4 blocks -- the worst-case distance from any
-// point in the +-16,000-block search square to the nearest anchor. A
-// triangular ("hex") lattice with nearest-neighbor spacing d has covering
-// radius d/sqrt(3); with d = 1920 blocks (480 quarts) the guarantee is
-// strictly tighter (1108.5 blocks) while the lattice needs fewer anchors per
-// unit area (density ratio 4/(3*sqrt(3)) ~= 0.77 asymptotically). Layout:
-// 21 rows x 19 columns = 399 anchors (was 441):
+// ANCHOR LATTICE. Sampling every point of the +-16,000-block search square
+// is not feasible, so the search tests a fixed lattice of anchor points and
+// takes a closer look wherever an anchor reports low erosion. The lattice is
+// hexagonal: for a given nearest-neighbor spacing it covers the plane with
+// fewer anchors than a square grid, and with a smaller worst-case distance
+// from any point to the nearest anchor. At 1,920-block spacing that worst
+// case is 1108.5 blocks (d / sqrt(3)); a square grid with 1,600-block steps
+// would sit at 1131.4 blocks (800 * sqrt(2)) while needing about a third
+// more anchors per unit area (hex density ratio 4/(3*sqrt(3)) ~ 0.77). The
+// layout is 21 rows x 19 columns = 399 anchors, with alternating rows
+// shifted by half a spacing and some padding past the +-4,000-quart search
+// square so the rim is covered as well as the interior (x out to +-4,560,
+// z to +-4,157, in quarts):
 //   row r:  z = HEX_ROW_Z[r] = round((r-10) * 480 * sqrt(3)/2)
 //   col c:  x = (c-9)*480 + (r odd ? 240 : 0)
-// Alternating rows shift by half a spacing, so every interior anchor is the
-// center of a regular hexagon of six equidistant neighbors (E/W at +-480
-// quarts; the four diagonal ones at (+-240, +-zstep)). The lattice is padded
-// past the +-4000-quart search square (x to +-4320+, z to +-4157) so rim
-// coverage doesn't sag versus the old grid, whose anchors sat on the rim.
-// (To experiment with the spacing: change HEX_D and regenerate HEX_ROW_Z as
-// round((r-10) * HEX_D * sqrt(3)/2), keeping rows padded past +-4000.)
+// To change the spacing, adjust HEX_D and regenerate HEX_ROW_Z with the same
+// formula, keeping the lattice padded past the search square.
 //
-// Shared probe. The old kernel probed every anchor with 5 dedicated noise
-// samples (center + 4 ring at 1200 blocks): 2205 samples per seed, ~96% of
-// this stage's work. This kernel instead samples a shared lattice once per
-// seed: every anchor center, plus the midpoint of every hex edge. Each
-// midpoint lies 960 blocks from its two flanking anchors -- inside the
-// r=1600-block disc the probe predicts -- and is used by exactly those two
-// anchors. s_pts layout (all 0B-erosion samples):
-//   [0, NA)     anchor centers
-//   [NA, 2NA)   E-edge midpoints  (anchor -> east neighbor)
-//   [2NA, 3NA)  UR-edge midpoints (anchor -> up-right neighbor)
-//   [3NA, 4NA)  UL-edge midpoints (anchor -> up-left neighbor)
-// Backward edges (W, down-left, down-right) are the forward edges of the
-// neighbors behind. Precompute = 4*N_ANCHORS noise samples; the probe itself
-// is seven shared-memory gathers per anchor and NO noise math.
+// SHARED PROBE LATTICE. The 7-point probe described above the PROBE_GATE
+// definition would cost 7 noise evaluations per anchor if every anchor
+// computed its own. Instead, the kernel samples a shared lattice once per
+// seed: every anchor center plus the midpoint of every hex edge. Each edge
+// midpoint serves exactly the two anchors it lies between, so the whole
+// pre-probe costs 4 * N_ANCHORS noise evaluations per seed, and probing one
+// anchor is then seven shared-memory reads. s_pts layout (all erosion 0B):
+//   [0, NA)      anchor centers
+//   [NA, 2NA)    east edge midpoints
+//   [2NA, 3NA)   up-right edge midpoints
+//   [3NA, 4NA)   up-left edge midpoints
+// The three backward directions (west, down-left, down-right) are the
+// forward edges of the anchors behind, so they need no samples of their own.
+// Anchors on the lattice rim lack some neighbors and reuse anchor-local
+// values for the missing midpoints, which only softens probes anchored
+// outside the search square.
 //
-// An anchor advances to the disc scan iff >= PROBE_NEED of its 7 probe points
-// read <= PROBE_GATE (file scope). Rim anchors (row 0, first/last column --
-// all outside the search square) mirror the opposite side's midpoint where a
-// neighbor is missing; this only softens probes anchored outside +-16k.
-//
-// Survivors get the exact same fail-fast phyllotaxis disc scan as before
-// (recipe step 2), one full warp per surviving anchor, and emit at the
-// centroid of their hit samples.
+// DISC SCAN. Anchors that pass the probe get the real test: 96 samples
+// arranged in a phyllotaxis (golden-angle) spiral over a disc of radius
+// 1,600 blocks, counted in three fail-fast batches of 32. The anchor passes
+// with at least 77 samples (~80%) reading erosion 0B at or below -0.40, and
+// it emits the centroid of its passing samples, so later checks center on
+// the low-erosion heart of the area rather than the lattice point that
+// happened to detect it. One warp per surviving anchor.
 // ===========================================================================
 namespace KernelCoverage {
 constexpr uint32_t THREADS_PER_BLOCK = 256;
@@ -482,9 +512,9 @@ __device__ constexpr int32_t HEX_ROW_Z[HEX_ROWS] = {
 };
 constexpr uint32_t N_ANCHORS = (uint32_t)(HEX_ROWS * HEX_COLS); // 399
 
-constexpr int32_t  DISC_R_Q    = CORE_BLOB_RADIUS / 4;                    // 400
-constexpr int      COV_N       = CORE_COV_SAMPLES;   // 96 = 3 covers x 32
-constexpr int      COV_NEED    = CORE_COV_NEED;      // 77  = ~80% of 96
+constexpr int32_t  DISC_R_Q    = CORE_BLOB_RADIUS / 4;  // disc radius in quarts (400)
+constexpr int      COV_N       = CORE_COV_SAMPLES;      // 96: three phyllotaxis batches of 32
+constexpr int      COV_NEED    = CORE_COV_NEED;         // 77: ~80% must pass
 static_assert(N_ANCHORS == 399, "hex lattice coverage");
 static_assert(COV_N % DISC_COVER_POINTS == 0, "coverage batches line up with disc covers");
 
@@ -494,9 +524,9 @@ struct AnchorHit {
 };
 
 // Per-batch funnel counters live in a device buffer passed by the host
-// (BatchBuf::counts), not a __device__ global: with two streams in flight, a
-// global reset would race with the other stream's in-flight coverage kernel
-// and silently eat counts (which is why "probed" under-reported).
+// (BatchBuf::counts), rather than a __device__ global. With two streams in flight,
+// resetting a global would race with the other stream's in-flight coverage
+// kernel and silently drop counts.
 // [0] = anchors probed, [1] = survived the shared 7-point probe,
 // [2] = emitted (passed the disc coverage).
 
@@ -518,7 +548,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
     __shared__ float s_pts[4 * N_ANCHORS]; // shared probe lattice (see above)
 
     const uint32_t seed_index = blockIdx.x;
-    if (seed_index >= seeds.size()) return; // whole block: no sync hazard
+    // The whole block exits together here, so the __syncthreads() below
+    // cannot deadlock.
+    if (seed_index >= seeds.size()) return;
     const MountainNoiseResult &noise = results[seed_index];
 
     load_grad_table_shared(s_grad); // includes __syncthreads()
@@ -526,8 +558,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
     load_noise_shared(s_ero0B, noise.erosion_b[0]);
     __syncthreads();
 
-    // --- Precompute the shared probe lattice: 4*N_ANCHORS independent
-    // samples. This is the only noise sampling most seeds ever get.
+    // --- Fill the shared probe lattice: 4 * N_ANCHORS independent noise
+    // evaluations, the only ones the vast majority of seeds will ever get.
     for (uint32_t j = threadIdx.x; j < 4 * N_ANCHORS; j += THREADS_PER_BLOCK) {
         const uint32_t kind = j / N_ANCHORS;      // 0 center, 1 E, 2 UR, 3 UL
         const uint32_t a    = j - kind * N_ANCHORS;
@@ -538,7 +570,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
             xq += HEX_D / 2;
         } else if (kind >= 2) {                   // diagonal-edge midpoint: (+-120, up/2)
             const uint32_t rup = (r + 1u < (uint32_t)HEX_ROWS) ? r + 1u : r;
-            zq = (zq + HEX_ROW_Z[rup] + 1) >> 1;  // deterministic round-half-up
+            zq = (zq + HEX_ROW_Z[rup] + 1) >> 1;  // midpoint, rounded half-up so both anchors agree
             xq += (kind == 2) ? (HEX_D / 4) : -(HEX_D / 4);
         }
         s_pts[j] = sample_climate_trunc(s_grad, &s_ero0A, &s_ero0B, D_EROSION_CFG,
@@ -549,7 +581,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
     const uint32_t warp = threadIdx.x >> 5;
     const uint32_t lane = threadIdx.x & 31;
 
-    // Preload this lane's disc offsets (one per cover/batch; lane-coalesced).
+    // Preload this lane's disc offsets: lane L carries sample L of each
+    // 32-sample batch, so the table loads stay coalesced.
     int32_t ddx[CORE_COVERS], ddz[CORE_COVERS];
     #pragma unroll
     for (int b = 0; b < CORE_COVERS; b++) {
@@ -558,9 +591,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
         ddz[b] = __float2int_rn((float)g_disc.z[k] * (DISC_R_Q / 32767.0f));
     }
 
-    // --- Probe: one anchor per lane, seven shared-memory gathers each, no
-    // noise math. Then the whole warp disc-scans each survivor, exactly as
-    // before: fail-fast phyllotaxis batches, emission at the hit centroid.
+    // --- Probe phase: one anchor per lane and seven shared-memory lookups
+    // each, with no noise evaluation at all. The warp then disc-scans each
+    // surviving anchor one at a time.
     for (uint32_t base = warp * 32; base < N_ANCHORS; base += WARPS_PER_BLOCK * 32) {
         const uint32_t a = base + lane;
         bool probe_ok = false;
@@ -572,10 +605,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
             const float vUR = s_pts[2 * N_ANCHORS + a]; // up-right midpoint (mine)
             const float vUL = s_pts[3 * N_ANCHORS + a]; // up-left midpoint (mine)
             const float vW  = s_pts[N_ANCHORS + (c > 0 ? a - 1 : a)]; // E midpoint of the west anchor
-            // Down-side midpoints = the up-midpoints of the two anchors in
-            // the row below; which columns those are flips with row parity
-            // (even rows: UL of (r-1,c) and UR of (r-1,c-1); odd rows mirror
-            // that). Row 0 clamps to its own row (rim only, outside +-16k).
+            // The two downward midpoints are stored as the up-midpoints of
+            // the anchors one row back; which columns they sit in flips with
+            // the row's parity. Row 0 has no row behind it and reuses its
+            // own values (rim anchors only, all outside the search square).
             const uint32_t rd = (r > 0) ? (a - (uint32_t)HEX_COLS) : a;
             float vDR, vDL;
             if ((r & 1u) == 0) {
@@ -597,7 +630,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
             if (pass) atomicAdd(&stage_counts[1], (uint32_t)__popc(pass));  // probe-passed
         }
 
-        // --- disc coverage: whole warp per surviving anchor (unchanged) ---
+        // --- Disc coverage: one surviving anchor at a time, the whole warp on it. ---
         while (pass) {
             const uint32_t b = (uint32_t)(__ffs((int)pass) - 1);
             pass &= pass - 1u;
@@ -620,7 +653,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
             }
             if (!alive || hits < COV_NEED) continue;
 
-            // Centroid of hits (only lane 0 needs the sums).
+            // Centroid of the passing samples (warp reduction; only lane 0
+            // needs the sums).
             for (int o = 16; o; o >>= 1) {
                 sdx += __shfl_down_sync(~0u, sdx, o);
                 sdz += __shfl_down_sync(~0u, sdz, o);
@@ -637,24 +671,32 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
 } // namespace KernelCoverage
 
 // ===========================================================================
-// Stage 3: late initialization of continentalness/temperature tables plus the
-// six erosion tables deferred from KernelInit and the four (2,2)-truncated
-// weirdness tables. One WARP per surviving anchor: lane 0 claims the seed
-// once per batch (init_flags CAS), then all 32 lanes build the 32 remaining
-// tables in parallel. Other anchors of the same seed (in any warp) skip.
-// Stream ordering guarantees the tables are visible to the next kernel.
-// Lane map: 0-8 continentalness a | 9-17 continentalness b | 18-19 temp a |
-//           20-21 temp b | 22-24 erosion a[1..3] | 25-27 erosion b[1..3] |
-//           28-29 weirdness a[0..1] | 30-31 weirdness b[0..1]
+// Stage 3: build the remaining noise tables for seeds that survived stage 2:
+// the rest of erosion (6 tables), all of continentalness (18) and
+// temperature (4), and the truncated weirdness pair (4). One warp takes one
+// surviving anchor; lane 0 claims the anchor's seed for this batch with a
+// compare-and-swap on init_flags, then the 32 lanes build the 32 tables in
+// parallel. Anchors whose seed was already claimed by any warp skip, so each
+// seed is initialized exactly once per batch. Both kernels run in the same
+// stream, so the tables are guaranteed to be visible to the next kernel.
+//
+// Lane assignments:  0-8    continentalness A
+//                    9-17   continentalness B
+//                    18-19  temperature A
+//                    20-21  temperature B
+//                    22-24  erosion A[1..3]
+//                    25-27  erosion B[1..3]
+//                    28-29  weirdness A[0..1]
+//                    30-31  weirdness B[0..1]
 // ===========================================================================
 namespace KernelLateInit {
-constexpr uint32_t THREADS_PER_BLOCK = 128; // 4 warps/block; shared FY scratch below
+constexpr uint32_t THREADS_PER_BLOCK = 128; // 4 warps per block
 
-// Shared-memory FY scratch (wave 6b), same pattern as KernelInit: one 65-word
-// padded row per thread (64 words of permutation + 1 pad word), so byte-wise
-// swaps land on distinct banks: word index 65L + k/4 == (L + k/4) mod 32, i.e.
-// all 32 lanes hit 32 distinct banks at every step. Output tables are
-// bit-identical to the old init_climate_table path.
+// The same shared-memory shuffle scratch as KernelInit: one padded row per
+// thread (64 words of permutation plus one pad word, a 65-word stride), so
+// a warp's 32 lanes land on 32 different shared-memory banks at every
+// shuffle step instead of serializing on one. The tables come out
+// bit-identical to the straightforward path.
 __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
         InputBuffer<uint64_t> seeds,
         InputBuffer<KernelCoverage::AnchorHit> anchors,
@@ -704,13 +746,17 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
 } // namespace KernelLateInit
 
 // ---------------------------------------------------------------------------
-// Depth spline -> approximate surface height (1.18+). The spline tree is
-// version-static; we flatten cubiomes' initBiomeNoise() output once at
-// startup and evaluate per sample as
+// Approximate surface height from the depth spline (1.18+). Minecraft turns
+// continentalness, erosion, and weirdness into a "depth" value through a
+// small tree of cubic splines, and that depth maps to terrain height. The
+// tree is fixed for a given game version, so it is baked once at startup
+// from cubiomes' initBiomeNoise() output into the flat __constant__ arrays
+// below, and each sample is then
 //   approx_h = (10000/76) * (0.48125 + spline(c, e, w) + 0.015)
-// mirroring cubiomes' sampleClimatePara(NP_DEPTH, y=0) + mapApproxHeight.
-// The shift noise is deliberately skipped (<= ~20-block sample displacement,
-// invisible at 128-block pitch); the CPU height check stays authoritative.
+// matching cubiomes' sampleClimatePara(NP_DEPTH, y=0) plus mapApproxHeight.
+// The shift noise (a small positional jitter Minecraft applies to samples)
+// is skipped; at the sampling pitches used here it would move a sample by at
+// most ~20 blocks. The CPU verifier's height check stays authoritative.
 // ---------------------------------------------------------------------------
 struct DevSplineNode { float loc, der, leaf; int16_t child, pad; };
 struct DevSplineHead { int32_t typ, nnodes, node_off, pad; };
@@ -745,12 +791,16 @@ __device__ float spline_eval_node(int si, const float vals[4]) {
 }
 
 __device__ float approx_height(float c, float e, float w) {
+    // Minecraft folds weirdness into a "peaks and valleys" value: highest on
+    // ridge lines (|w| = 2/3), lowest on the valley axis (w = 0).
     const float pv = -3.0f * (fabsf(fabsf(w) - 0.6666667f) - 0.33333334f);
-    const float vals[4] = { c, e, pv, w }; // SP_CONTINENTALNESS, SP_EROSION, SP_RIDGES, SP_WEIRDNESS
+    const float vals[4] = { c, e, pv, w }; // spline input order: continentalness, erosion, peaks-and-valleys, weirdness
     const float off = spline_eval_node(g_spline_root, vals) + 0.015f;
     return (0.48125f + off) * (10000.0f / 76.0f);
 }
 
+// Flatten cubiomes' pointer-linked spline tree into the flat head/node
+// arrays the device code walks, and upload them to __constant__ memory.
 static void bake_and_upload_splines(int mc) {
     BiomeNoise bn;
     initBiomeNoise(&bn, mc);
@@ -786,53 +836,77 @@ static void bake_and_upload_splines(int mc) {
 }
 
 // ===========================================================================
-// Stage 4: windowed checks around each surviving anchor (recipe steps 3-6).
-// One warp per anchor. Cheap, moderately selective checks run first so the
-// expensive full-octave window scans only run for near-certain blobs:
-//   (6) temperature: >=65% of the 1000^2 window in [CORE_TEMP_MIN, CORE_TEMP_MAX]
-//   (4) continentalness: >=65% of the r=1600 disc >= 0 (1B truncation)
-//   (3) erosion: full-octave minimum over the 3200^2 window <= CORE_ERO_MIN_REQ
-//   (5) continentalness: full-octave maximum over that window >= CORE_CONT_MAX_REQ
-// Tables are read straight from global memory here (anchors in a block belong
-// to arbitrary seeds, so per-block shared staging does not pay off).
+// Stage 4: windowed checks around each surviving anchor, one warp per
+// anchor. The checks run cheapest and most-selective first, so the
+// expensive full-stack window scans only run for near-certain blobs:
+//
+//   1. Temperature coverage:  >= 65% of a 1000x1000-block window inside
+//                              [CORE_TEMP_MIN, CORE_TEMP_MAX] (full stack).
+//   2. Continentalness disc:  >= ~67% of the radius-1600 disc reading
+//                              inland (1B truncation, same phyllotaxis
+//                              pattern as stage 2).
+//   3. Weirdness ridge check: enough of the window inside the ridge band;
+//                              rejects windows too flat for a real mountain
+//                              pattern to form.
+//   4. Erosion minimum:       some point in a 3200x3200-block window at or
+//                              below CORE_ERO_MIN_REQ (full stack).
+//   5. Continentalness max:   some point in that window at or above
+//                              CORE_CONT_MAX_REQ (full stack).
+//   6. Height gate:           the highest approximate surface height in the
+//                              window reaches H_GATE_MIN.
+//
+// Noise tables are read straight from global memory in this kernel: the
+// anchors packed into a block belong to arbitrary seeds, so staging them in
+// shared memory would not pay off.
 // ===========================================================================
 namespace KernelExtrema {
 constexpr uint32_t THREADS_PER_BLOCK = 256;
 constexpr uint32_t WARPS_PER_BLOCK   = THREADS_PER_BLOCK / 32;
-constexpr int      CONT_COV_N    = CORE_COV_SAMPLES; // same disc as stage 2
-constexpr int      CONT_COV_NEED = 64;               // >= ~67% of 96
-constexpr int32_t  TEMP_HALF_Q = 125;   // centered square side 1000
-constexpr int32_t  TEMP_STEP_Q = 25;    // 100 blocks
+constexpr int      CONT_COV_N    = CORE_COV_SAMPLES; // the same 96-sample disc as stage 2
+constexpr int      CONT_COV_NEED = 64;               // ~67% must read inland
+constexpr int32_t  TEMP_HALF_Q = 125;   // half-width of the 1000-block window, in quarts
+constexpr int32_t  TEMP_STEP_Q = 25;    // 100-block sample pitch
 constexpr uint32_t TEMP_N      = 2 * (TEMP_HALF_Q / TEMP_STEP_Q) + 1;  // 11
 constexpr uint32_t TEMP_POINTS = TEMP_N * TEMP_N;                      // 121
-constexpr uint32_t TEMP_NEED   = 79;                                   // >= 65% of 121
-constexpr int32_t  WIN_HALF_Q  = 400;   // centered square side 3200
-constexpr int32_t  WIN_STEP_Q  = 16;    // 64 blocks (Nyquist for the shortest
-                                        // erosion octave, wavelength 128 blocks)
+constexpr uint32_t TEMP_NEED   = 79;                                   // ~65% must be temperate
+constexpr int32_t  WIN_HALF_Q  = 400;   // half-width of the 3200-block window, in quarts
+constexpr int32_t  WIN_STEP_Q  = 16;    // 64-block pitch, fine enough for the shortest
+                                        // erosion octave (128-block wavelength)
 constexpr uint32_t WIN_N       = 2 * (WIN_HALF_Q / WIN_STEP_Q) + 1;    // 51
 constexpr uint32_t WIN_POINTS  = WIN_N * WIN_N;                        // 2601
 
-// (w) Weirdness-texture veto on the (2,2) field. Revised per an old 57k-row
-// corpus (score_lens.py, gem = score >= 8): valley fraction has d = -0.36
-// (gems have less river-axis texture than the average survivor), so the
-// valley term is disabled (0.0 passes everything). Ridge keeps a featherweight
-// veto only: corpus knob 0.0188, extra margin for anchor-window + truncation.
-// Set W_TEX_RIDGE_MIN to 0.0f to disable the whole veto.
-constexpr float    W_TEX_BAND_LO  =  0.55f;   // ridge band: |w| in [lo, hi]
+// The weirdness texture check, on the two-octave truncation (octaves 0 and
+// 1, sides A and B). Weirdness drives Minecraft's peaks-and-valleys pattern:
+// |w| near 2/3 marks ridge lines, while w near 0 marks the valley and river
+// axis. A window with no ridge-band values at all is too flat for a real
+// mountain pattern to form, so a small minimum ridge fraction is enforced.
+//
+// The threshold comes from measuring ~57,000 verified output rows with
+// seedlab.py lens and comparing the best-scoring regions (score >= 8) with
+// the rest. Valley frequency did not separate the two groups (the best
+// regions, if anything, showed slightly less valley-axis texture), so only
+// the ridge term is enforced, and even that is set well below the corpus
+// value of 0.0188 to leave room for the coarser window placement and the
+// truncated octaves. Set W_TEX_RIDGE_MIN to 0 to disable the check entirely.
+constexpr float    W_TEX_BAND_LO  =  0.55f;   // the ridge band: |w| in [0.55, 0.82]
 constexpr float    W_TEX_BAND_HI  =  0.82f;
-constexpr float    W_TEX_RIDGE_MIN = 0.012f;  // min ridge-band fraction
-constexpr float    W_TEX_VALLEY_TH =  0.17f;  // valley axis: |w| <= th
-constexpr float    W_TEX_VALLEY_MIN = 0.0f;   // disabled (corpus: no signal)
+constexpr float    W_TEX_RIDGE_MIN = 0.012f;  // minimum ridge-band fraction of the window
+constexpr float    W_TEX_VALLEY_TH =  0.17f;  // the valley axis: |w| at or below this
+constexpr float    W_TEX_VALLEY_MIN = 0.0f;   // disabled: the corpus showed no signal here
 constexpr int32_t  W_TEX_STEP_Q   = 25;       // 100-block pitch
 constexpr int32_t  W_TEX_HALF_Q   = 400;
 constexpr uint32_t W_TEX_N        = 2 * (W_TEX_HALF_Q / W_TEX_STEP_Q) + 1; // 33
 constexpr uint32_t W_TEX_POINTS   = W_TEX_N * W_TEX_N;                     // 1089
 
-// (h) Approx-height gate via the depth spline (Step 4). Corpus: hMax kills 42%
-// of survivors at 98% gem recall (t=238.7); maxY agrees (t=237). Transfer
-// margin x0.9 for the coarse lattice + skipped shift noise -> 215. Runs last,
-// after (3)/(5), on the ~3k cores per batch, so it costs ~nothing GPU-side.
-// The CPU height window stays authoritative.
+// Check 6, the height gate: the best approximate surface height in the
+// window (from the depth spline above) must reach H_GATE_MIN. The threshold
+// comes from the verifier's measured peak heights: gating at 238.7 would
+// keep 98% of the best-scoring regions while discarding 42% of the rest, and
+// the CPU-side maxY column agrees almost exactly (237). The GPU measurement
+// is coarser (wider pitch, no shift noise), so the gate sits at 215, about
+// 0.9x, to avoid cutting candidates the CPU would have passed. It runs last
+// so it only ever runs on the few dozen anchors per batch that get this far.
+// The CPU verifier's height check has the final word.
 constexpr float    H_GATE_MIN  = 215.0f;
 constexpr int32_t  H_STEP_Q    = 32;    // 128-block pitch
 constexpr int32_t  H_HALF_Q    = 384;
@@ -868,7 +942,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
         const KernelCoverage::AnchorHit anchor = anchors.data[anchor_index];
         const MountainNoiseResult &noise = results[anchor.seed_index];
 
-        // (6) core cool-temperature coverage over the window.
+        // Check 1: temperature coverage over the window.
         uint32_t temp_hits = 0;
         for (uint32_t p = lane; p < TEMP_POINTS; p += 32) {
             const int32_t xq = anchor.xq + (int32_t)(p % TEMP_N) * TEMP_STEP_Q - TEMP_HALF_Q;
@@ -879,8 +953,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
         }
         if (warp_reduce_add(temp_hits) < TEMP_NEED) continue;
 
-        // (4) core continentalness disc coverage (1B truncation), same
-        // fail-fast pattern as stage 2.
+        // Check 2: continentalness disc coverage (the 1B truncation), in
+        // the same fail-fast batches as stage 2's disc scan.
         int hits = 0;
         bool alive = true;
         #pragma unroll
@@ -895,7 +969,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
         }
         if (!alive || hits < CONT_COV_NEED) continue;
 
-        // (w) weirdness texture veto: ridge-band presence (valley term off).
+        // Check 3: weirdness ridge-band presence (the valley term is off).
         {
             uint32_t wridge = 0, wvalley = 0;
             for (uint32_t p = lane; p < W_TEX_POINTS; p += 32) {
@@ -913,9 +987,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
             if ((float)wvalley < W_TEX_VALLEY_MIN * W_TEX_POINTS) continue;
         }
 
-        // (3) deep erosion point: full-octave minimum over the window.
-        // Early-exit variant: any point below the threshold passes; the warp
-        // stops at the first 32-point batch containing a hit.
+        // Check 4: the deep-erosion point. Full-stack minimum over the
+        // window; a single point below the threshold passes, so the warp
+        // stops at the first 32-sample batch that contains one.
         bool ero_ok = false;
         for (uint32_t base_p = 0; base_p < WIN_POINTS && !ero_ok; base_p += 32) {
             const uint32_t p = base_p + lane;
@@ -931,7 +1005,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
         }
         if (!ero_ok) continue;
 
-        // (5) high continentalness point: full-octave maximum over the window.
+        // Check 5: the high-continentalness point: a full-stack maximum over
+        // the same window, with the same early exit.
         bool cont_ok = false;
         for (uint32_t base_p = 0; base_p < WIN_POINTS && !cont_ok; base_p += 32) {
             const uint32_t p = base_p + lane;
@@ -947,7 +1022,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
         }
         if (!cont_ok) continue;
 
-        // (h) approx peak height via the depth spline (full c/e, (2,2) w).
+        // Check 6: approximate peak height from the depth spline (full
+        // continentalness and erosion, truncated weirdness).
         {
             float h_max = -FLT_MAX;
             for (uint32_t p = lane; p < H_POINTS; p += 32) {
@@ -975,26 +1051,29 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
 } // namespace KernelExtrema
 
 // ===========================================================================
-// Stage 5: contiguous-region flood fill (the megaregion measurement).
+// Stage 5: the flood fill, the actual megaregion measurement.
 //
-// One thread block per core hit. The block holds the shared noise tables the
-// blob field needs plus three lattice bitmaps in shared memory and runs a
-// wavefront BFS from the core's centroid over the multi-climate field
-// (common.h BLOB_*), sampled on a 64-block lattice with +-8000 blocks of
-// reach. Each round, the 256 threads expand the current frontier into its
-// 4-neighbors and claim passing cells with atomic bitmap ops. The search
-// stops the instant the connected area crosses TARGET_BLOB_CELLS (pass), when
-// the frontier dies (fail: the region is a puddle), or at a round cap far
-// beyond the lattice's diameter (fail, safety net only).
+// One thread block takes one surviving anchor and flood-fills the connected
+// region around it. A cell of the 64-block lattice joins the region if it
+// passes all three shared field tests from common.h (BLOB_*): erosion 0B at
+// or below the ceiling, continentalness 1B at or above the floor, and
+// temperature 0B inside the window. The block keeps the noise tables and
+// three lattice bitmaps in shared memory and expands the frontier one ring
+// per round, with all 512 threads claiming new cells through atomic bitmap
+// operations. The fill ends the moment the connected area crosses the
+// runtime target (a pass), when the frontier runs out of qualifying cells
+// (a fail: the area is a puddle), or at a generous round cap that exists
+// only as a safety net. The fill reaches +-8,000 blocks from the anchor;
+// regions that run off that edge are flagged and forwarded, since the CPU's
+// +-48,000-block re-measurement can still see their full extent.
 // ===========================================================================
 namespace KernelBlob {
-constexpr uint32_t THREADS_PER_BLOCK = 512;  // 256 -> 512: halves the BFS wavefront
-                                             // latency; the shared-memory budget is
-                                             // unchanged. Revert if --debug shows a
-                                             // slower blobfill stage.
-constexpr uint32_t GRID_BLOCKS       = 1024; // grid-stride over cores
+constexpr uint32_t THREADS_PER_BLOCK = 512;  // 512 threads halve the per-round
+                                             // wavefront latency vs 256; the
+                                             // shared-memory budget is unchanged.
+constexpr uint32_t GRID_BLOCKS       = 1024; // blocks drawing anchors off the work counter
 
-// Lattice geometry: 64 blocks per cell (16 quart), +-125 cells = +-8000 blocks.
+// Lattice geometry: 64 blocks (16 quarts) per cell, +-125 cells = +-8,000 blocks.
 constexpr int32_t  STEP_Q = 16;
 constexpr int32_t  HALF   = 8000 / 64;   // 125
 constexpr int32_t  DIM    = 2 * HALF + 1; // 251
@@ -1002,23 +1081,25 @@ constexpr uint32_t NCELLS = (uint32_t)(DIM * DIM);   // 63001
 constexpr uint32_t WORDS  = (NCELLS + 31u) / 32u;    // 1969 (~7.7 KB per bitmap)
 
 // Tunables:
-//   pass target: g_blobcfg.target_cells, pushed from main() as 0.88x the CPU
-//     area gate (in 4096-block^2 cells) -- the float32 prefilter is always
-//     looser than the double-precision CPU re-measurement.
-//   MAX_ROUNDS: pure safety net; far beyond the lattice's diameter (500),
-//     and generous enough for long snaking regions.
-//   PER_SEED_CAP: at most this many candidates emitted per seed per batch.
-//   Tier-2 texture gates (post-fill, passing fills only). v6: MEASURE-ONLY
-//   (0 disables) -- calibrate from the gpuH/gpuDh output columns, then gate
-//   in v7. (v5 gated blob height at 230 inside the fill: it cost 4/200 recall
-//   on peaks just off the blob's field edge, and inflated blobfill ~6x by
-//   removing the area early-exit for big-but-flat fills.)
+//   Early-exit target: g_blobcfg.target_cells, pushed from main() as 0.88x
+//     the CPU area gate (in 4096-block cells), so the float32 prefilter is
+//     always looser than the CPU's double-precision re-measurement.
+//   MAX_ROUNDS: a safety net only, far beyond the lattice's 500-round
+//     diameter and generous enough for long snaking regions.
+//   PER_SEED_CAP: at most this many candidates per seed per batch.
+//   The tier-2 texture gates run after the fill, on passing fills only, and
+//     are currently measure-only (0 disables them): calibrate against the
+//     gpuH/gpuDh output columns before enabling either. Gating on height
+//     inside the fill was tried at 230 and abandoned: it lost 4 of 200
+//     recall-test seeds to peaks just outside the blob's field edge, and it
+//     made this stage about 6x slower by disabling the area early exit for
+//     big-but-flat fills.
 constexpr uint32_t MAX_ROUNDS      = 2048;
-constexpr uint32_t BLOB2_H_MIN_I   = 0;     // tier-2 blob h_max gate (0 = off)
-constexpr float    BLOB2_DH_MIN    = 0.0f;  // tier-2 mean |dh| gate, 128-block pitch (0 = off)
+constexpr uint32_t BLOB2_H_MIN_I   = 0;     // tier-2 max-height gate (0 = off)
+constexpr float    BLOB2_DH_MIN    = 0.0f;  // tier-2 mean neighbor-height-difference gate (0 = off)
 constexpr uint32_t PER_SEED_CAP    = 16;
-// Morphological closing on the blob mask: 1 = enable (dilate then erode one cell).
-// This bridges single-cell gaps (e.g. river gorges) without inflating area.
+// One-cell morphological closing on the blob mask (dilate, then erode):
+// bridges single-cell gaps such as river gorges without inflating the area.
 constexpr int      BLOB_CLOSE1     = 1;
 
 __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
@@ -1029,22 +1110,23 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
         uint32_t *__restrict__ emit_counts,
         uint32_t *__restrict__ work_counter) {
     __shared__ GradDotTable s_grad;
-    __shared__ ImprovedNoise s_ero_a[4], s_ero_b[4];      // full erosion (blob-scale height)
+    __shared__ ImprovedNoise s_ero_a[4], s_ero_b[4];      // full erosion (for the height stats)
     __shared__ ImprovedNoise s_cont_a[9], s_cont_b[9];    // full continentalness
-    __shared__ ImprovedNoise s_temp0A, s_temp0B;          // temperature 0B (blob field)
-    __shared__ ImprovedNoise s_weird_a[2], s_weird_b[2];  // weirdness (2,2) (height spline)
+    __shared__ ImprovedNoise s_temp0A, s_temp0B;          // truncated temperature (the blob field)
+    __shared__ ImprovedNoise s_weird_a[2], s_weird_b[2];  // truncated weirdness (for the height spline)
     __shared__ uint32_t s_visited[WORDS];
     __shared__ uint32_t s_front[2][WORDS];
-    __shared__ uint32_t s_count;   // connected low-erosion cells claimed so far
+    __shared__ uint32_t s_count;   // connected blob-field cells claimed so far
     __shared__ uint32_t s_next;    // cells pushed into the next frontier this round
     __shared__ uint32_t s_seed;    // chosen seed cell index (or ~0u if none)
     __shared__ uint32_t s_state;   // 0 = running, 1 = pass, 2 = fail
     __shared__ uint32_t s_edge;    // 1 = fill touched the +-8000-block lattice rim
     // Tier-2 texture stats, measured after the fill and only for fills that
-    // passed the area gate (v6: measure-only; calibrate -> gate in v7):
-    //   s_hmax:  blob-scale max approx height (whole blocks)
-    //   s_dh_*:  mean |height difference| between stride-2 (128-block-pitch)
-    //            neighbors -- the corpus' dhMean/bw3200Dh discriminator domain
+    // passed the area gate (currently measure-only, see the tunables above):
+    //   s_hmax:  the region's maximum approximate height, whole blocks
+    //   s_dh_*:  mean height difference between neighboring samples at the
+    //            128-block pitch, the same measurement domain the scoring
+    //            system uses for its steepness stats
     __shared__ uint32_t s_hmax;    // max approx height in whole blocks (atomicMax)
     __shared__ float    s_dh_sum;  // sum of |dh| over measured pairs
     __shared__ uint32_t s_dh_cnt;  // measured pair count
@@ -1054,10 +1136,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
 
     const uint32_t cores_len = cores.size();
     while (true) {
-        // Work-stealing: one thread claims the next core atomically and
-        // broadcasts the index to the rest of the block via shared memory.
-        // This removes static grid-stride imbalance when one block draws
-        // two large fills back-to-back.
+        // Work-stealing: thread 0 claims the next anchor index off an atomic
+        // counter and shares it with the rest of the block through shared
+        // memory, so a block that draws two large fills in a row cannot hold
+        // up the others.
         __shared__ uint32_t s_core_idx;
         if (tid == 0)
             s_core_idx = atomicAdd(work_counter, 1u);
@@ -1077,11 +1159,12 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
             s_front[1][w]  = 0u;
         }
         __syncthreads();
-        // Lazy table loading: the fill only reads 8 tables (erosion 0B pair,
-        // continentalness 1B four-pack, temperature 0B pair). The remaining 24
-        // tables are only sampled by the tier-2 texture pass, which runs for
-        // ~1% of fills (s_state == 1) -- load them lazily there instead of
-        // paying ~24 global round-trips of latency on every fill.
+        // The fill itself reads only 8 tables (the truncated erosion pair,
+        // the four truncated continentalness tables, and the truncated
+        // temperature pair). The other 24 are only needed by the tier-2
+        // texture pass, which runs on a small minority of fills, so those
+        // are loaded there instead of paying their global-memory latency on
+        // every fill.
         load_noise_shared(s_ero_a[0], noise.erosion_a[0]);
         load_noise_shared(s_ero_b[0], noise.erosion_b[0]);
         load_noise_shared(s_cont_a[0], noise.cont_a[0]);
@@ -1092,7 +1175,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
         load_noise_shared(s_temp0B, noise.temp_b[0]);
         __syncthreads();
 
-        // Full-octave approx height at one lattice cell (tier-2 texture scan).
+        // Full-stack approximate height at one lattice cell (tier-2 only).
         auto blob_h_at = [&](int32_t i, int32_t j) {
             const int32_t xq = core.xq + i * STEP_Q;
             const int32_t zq = core.zq + j * STEP_Q;
@@ -1102,8 +1185,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
             return approx_height(cf, ef, wf);
         };
 
-        // -- Pick the seed cell (thread 0). The centroid is normally already
-        // low-erosion; if it isn't (concave blob), nudge out two lattice rings.
+        // -- Choose the fill's starting cell (thread 0). The anchor centroid
+        // is normally already inside the region; for a concave region it
+        // might not be, so search outward up to two lattice rings for a
+        // valid cell.
         if (tid == 0) {
             auto low_at = [&](int32_t i, int32_t j) {
                 int32_t xq = core.xq + i * STEP_Q;
@@ -1129,12 +1214,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
                 s_front[0][s_seed >> 5] |= 1u << (s_seed & 31);
                 s_count = 1;
             } else {
-                s_state = 2; // no low-erosion cell at the core: dead on arrival
+                s_state = 2; // no valid cell near the anchor: fail immediately
             }
         }
         __syncthreads();
 
-        // -- Wavefront BFS.
+        // -- Wavefront BFS: expand the frontier one ring per round until the
+        // area target is hit or the region stops growing.
         uint32_t parity = 0;
         for (uint32_t round = 0; round < MAX_ROUNDS && s_state == 0; round++) {
             if (tid == 0) s_next = 0;
@@ -1185,11 +1271,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
             __syncthreads();
             if (tid == 0) {
                 if (s_count >= g_blobcfg.target_cells) s_state = 1;
-                // Frontier died: normally a "puddle" fail. But if the fill hit
-                // the +-8000-block lattice rim, this may be an elongated range
-                // whose true area only the CPU's +-48000-block fill can see --
-                // forward it instead of dropping it. Recall-vs-CPU knob: raise
-                // the /2 (e.g. *3/4) to emit fewer of these.
+                // The frontier died: normally a fail (the region is a
+                // puddle). The exception is a fill that reached the
+                // +-8,000-block lattice rim: it may be an elongated range
+                // whose true area only the CPU's +-48,000-block fill can
+                // see, so forward it if it reached at least half the target.
+                // Raising that fraction (to 3/4, say) emits fewer of these
+                // for the CPU to reject.
                 else if (s_next == 0u)
                     s_state = (s_edge && s_count >= g_blobcfg.target_cells / 2) ? 1 : 2;
             }
@@ -1197,21 +1285,23 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
             parity ^= 1;
         }
 
-        // True one-cell morphological closing (dilate: an unset cell with any
-        // set 4-neighbor joins; erode: a cell adjacent to any unset 4-neighbor
-        // leaves). The dilation ring is stripped back off by the erosion, so
-        // the original blob always survives and the measured area can only
-        // grow by the bridged 1-cell gaps -- never shrink. s_front is idle at
-        // this point and serves as scratch. (Wave-1 bug fixed: the previous
-        // >=3-dilate / <4-erode variant shaved the entire boundary, making
-        // the CPU area gate several percent stricter than intended.)
+        // One-cell morphological closing, applied to passing fills. Dilation
+        // adds every unset cell that touches the region; erosion then strips
+        // the added ring back off. The net effect is that one-cell gaps
+        // (river gorges, mostly) get bridged, while the original region
+        // always survives and the measured area can never shrink. The two
+        // frontier bitmaps are idle at this point and serve as scratch.
         if (BLOB_CLOSE1 && s_state == 1) {
-            uint32_t *s_dilate = s_front[0];
-            for (uint32_t w = tid; w < WORDS; w += THREADS_PER_BLOCK)
+            uint32_t *s_dilate = s_front[0]; // dilated mask
+            uint32_t *s_erode  = s_front[1]; // closed mask
+            
+            for (uint32_t w = tid; w < WORDS; w += THREADS_PER_BLOCK) {
                 s_dilate[w] = 0u;
+                s_erode[w]  = 0u; // clear the output buffer
+            }
             __syncthreads();
-            // Dilate densely: gap cells are UNset, so iterating only the
-            // visited bits can never find them -- every cell must be scanned.
+            // Dilate: this has to check every cell; the gap cells we are
+            // looking for are exactly the unset ones.
             for (uint32_t c = tid; c < NCELLS; c += THREADS_PER_BLOCK) {
                 const uint32_t w = c >> 5, b = c & 31;
                 uint32_t v = (s_visited[w] >> b) & 1u;
@@ -1226,41 +1316,55 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
                 if (v) atomicOr(&s_dilate[w], 1u << b);
             }
             __syncthreads();
-            // Erode: drop dilated cells adjacent to an unset 4-neighbor
-            // (out-of-lattice counts as unset; only matters for edge-clipped
-            // fills). This removes the dilation ring.
+            // Erode: drop every dilated cell that still touches an unset
+            // neighbor (cells past the lattice rim count as unset, which
+            // only matters for edge-clipped fills). This removes the dilation ring.
+            // 
+            // Race fix: Read exclusively from s_dilate, write survivors to s_erode.
+            // Writing in-place to s_dilate causes a data race. Thread A might
+            // read cell X+1 to check its neighbors at the exact moment Thread B
+            // is eroding cell X+1 via atomicAnd. A plain read happening at the
+            // same time as an atomic write is "undefined behavior" (the GPU
+            // is allowed to return a garbled value). We avoid this by
+            // writing to a separate buffer. s_front[1] is currently idle (the
+            // BFS is over), so we recycle it as s_erode for free.
             for (uint32_t c = tid; c < NCELLS; c += THREADS_PER_BLOCK) {
                 const uint32_t w = c >> 5, b = c & 31;
-                if (!((s_dilate[w] >> b) & 1u)) continue;
+                // Read from s_dilate
+                if (!((s_dilate[w] >> b) & 1u)) continue; 
                 const int32_t i = (int32_t)(c % (uint32_t)DIM) - HALF;
                 const int32_t j = (int32_t)(c / (uint32_t)DIM) - HALF;
                 int keep = 1;
+                // Read neighbors from s_dilate (safe cuz it's never modified in this loop)
                 if (i > -HALF) keep &= (int)((s_dilate[(c - 1)   >> 5] >> ((c - 1)   & 31)) & 1u); else keep = 0;
                 if (i <  HALF) keep &= (int)((s_dilate[(c + 1)   >> 5] >> ((c + 1)   & 31)) & 1u); else keep = 0;
                 if (j > -HALF) keep &= (int)((s_dilate[(c - DIM) >> 5] >> ((c - DIM) & 31)) & 1u); else keep = 0;
                 if (j <  HALF) keep &= (int)((s_dilate[(c + DIM) >> 5] >> ((c + DIM) & 31)) & 1u); else keep = 0;
-                if (!keep) atomicAnd(&s_dilate[w], ~(1u << b));
+                // Write survivors to s_erode using atomicOr
+                if (keep) atomicOr(&s_erode[w], 1u << b);
             }
             __syncthreads();
-            // Copy back to visited and recount.
+            // Copy back to visited and recount the area.
             if (tid == 0) s_count = 0;
             __syncthreads();
             for (uint32_t w = tid; w < WORDS; w += THREADS_PER_BLOCK) {
-                const uint32_t v = s_dilate[w];
+                // Read final state from s_erode
+                const uint32_t v = s_erode[w]; 
                 s_visited[w] = v;
                 if (v) atomicAdd(&s_count, __popc(v));
             }
             __syncthreads();
         }
 
-        // -- Tier 2 (passing fills only): blob-scale texture stats over the
-        // visited bitmap, on the stride-2 sublattice (128-block pitch = the
-        // corpus' dhMean/bw1664Dh measurement domain). We first compute a
-        // shared-memory bounding box, then sample heights only inside it.
-        // The ~3x neighbor recompute is negligible at ~10 passing fills/batch,
-        // and dropping the big tile buffer lets us stay under 48 KiB/shared.
-        // Deferred table loads (only passing fills reach here; s_state is
-        // block-uniform, so the strided loads are safe):
+        // -- Tier 2, for passing fills only: region-scale texture stats over
+        // the visited bitmap, measured every other lattice cell (a 128-block
+        // pitch, the same spacing the scoring system's steepness stats use).
+        // First a bounding box is computed in shared memory, then heights
+        // are sampled only inside it. Neighbor cells are recomputed rather
+        // than cached (about 3x the samples), which is cheap at the observed
+        // rate of passing fills and keeps the block's shared-memory
+        // footprint under 48 KiB. The deferred noise tables are also loaded
+        // now; s_state is block-uniform here, so the strided loads are safe.
         if (s_state == 1) {
             for (int i = 1; i < 4; i++) { load_noise_shared(s_ero_a[i], noise.erosion_a[i]);
                                           load_noise_shared(s_ero_b[i], noise.erosion_b[i]); }
@@ -1285,12 +1389,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
                     const int32_t i = (int32_t)(idx % (uint32_t)DIM) - HALF;
                     const int32_t j = (int32_t)(idx / (uint32_t)DIM) - HALF;
                     if ((i & 1) || (j & 1)) continue;
-                    // Signed atomics. The old uint32-punned versions let
-                    // negative lattice coords (i, j span +-HALF) win
-                    // atomicMax as huge unsigned values, so the bbox read
-                    // back with maxI2 < minI2 and the entire tier-2 texture
-                    // scan silently no-oped -- leaving gpuH = gpuDh = 0 on
-                    // every emitted candidate.
+                    // Signed atomics: i and j span +-HALF, and unsigned
+                    // atomicMin/Max would order negative offsets as huge
+                    // positive values.
                     atomicMin(&s_minI, i);
                     atomicMax(&s_maxI, i);
                     atomicMin(&s_minJ, j);
@@ -1331,7 +1432,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
                 }
             }
             __syncthreads();
-            // v7 gates (both OFF in v6): flat-blob veto + texture veto.
+            // Texture gates, both currently disabled: flat-blob veto + dh veto.
             if (tid == 0) {
                 const float dh = s_dh_cnt ? s_dh_sum / (float)s_dh_cnt : 0.0f;
                 if (BLOB2_H_MIN_I > 0 && s_hmax < BLOB2_H_MIN_I) s_state = 2;
@@ -1346,8 +1447,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void kernel(
                 if (out < outputs.max_len) {
                     const uint64_t seed = seeds.data[core.seed_index];
                     const float dh = s_dh_cnt ? s_dh_sum / (float)s_dh_cnt : 0.0f;
+                    // coordinates become blocks here (x4)
                     outputs.data[out] = { seed, core.xq * 4, core.zq * 4,
-                                          (int32_t)s_hmax, (int32_t)lrintf(dh * 8.0f) }; // quart -> blocks
+                        (int32_t)s_hmax, (int32_t)lrintf(dh * 8.0f) };
                 }
             }
         }
@@ -1367,13 +1469,14 @@ constexpr uint32_t GPU_MAX_ANCHORS = 1u << 20; // 12 MiB of AnchorHit
 constexpr uint32_t GPU_MAX_CORES   = 1u << 18; //  3 MiB of AnchorHit
 constexpr uint32_t GPU_MAX_OUTPUTS = 1u << 18;
 
-// One batch's worth of device buffers, counters, staging memory and timing
-// events. Two of these alternate across two CUDA streams, so the next batch's
-// KernelInit (latency-bound: serial per-thread Fisher-Yates dips) overlaps
-// the current batch's coverage/extrema/blob stages (compute-dense): the host
-// runs one batch ahead and harvests the older batch while the GPU keeps
-// working. If VRAM can't fit two sets, we fall back to one (pure serial
-// mode, identical to the old behavior).
+// Everything one batch needs on the device: buffers, counters, staging
+// memory, and timing events. Two of these structures alternate across two
+// CUDA streams, so while one batch runs the compute-heavy stages (coverage,
+// extrema, blob fill), the next batch's KernelInit, which is latency-bound
+// on its serial per-table shuffles, can already start. The host stays one
+// batch ahead and collects the older batch's results while the GPU keeps
+// working. If there isn't enough VRAM for two batches, the code falls back
+// to one and the batches simply run back to back.
 struct BatchBuf {
     void *seeds = nullptr, *results = nullptr, *anchors = nullptr, *cores = nullptr;
     void *fin = nullptr, *flags = nullptr, *emits = nullptr, *work = nullptr;
@@ -1440,7 +1543,7 @@ void GpuThread::run() {
                 nbuf, nbuf == 2 ? " (batch overlap on)" : " (single-buffer mode)");
 
     std::vector<GpuOutput> h_outputs(GPU_MAX_OUTPUTS);
-    uint64_t h_stage_counts[4] = {0, 0, 0, 0}; // 128 batches of anchors overflows 32 bits
+    uint64_t h_stage_counts[4] = {0, 0, 0, 0}; // 64-bit: anchor counts over a stats window overflow 32 bits
 
     // Per-stage statistics (printed every STATS_INTERVAL batches and once
     // more at shutdown so short --seeds runs still get a table).
@@ -1459,9 +1562,10 @@ void GpuThread::run() {
     uint64_t launched  = 0; // batches launched
     uint64_t harvested = 0; // batches synced + drained
 
-    // Sync one finished batch and drain its counters, timing events, and
-    // verified candidates. Runs at most one batch behind the launcher, so
-    // the other stream keeps the GPU busy while the host is doing this.
+    // Synchronize one finished batch and collect its counters, stage
+    // timings, and emitted candidates. This runs at most one batch behind
+    // the launcher, so the other stream keeps the GPU busy while the host
+    // works.
     auto harvest = [&](int s) {
         BatchBuf &b = bufs[s];
         cudaStream_t stream = streams[s];
@@ -1545,9 +1649,9 @@ void GpuThread::run() {
     };
 
     while (!should_stop()) {
-        // Backpressure: if the CPU verifiers are falling far behind, pause
+        // Backpressure: if the CPU verifiers are falling behind, pause
         // before starting the next batch so the candidate queue (and host
-        // memory) can't grow without bound.
+        // memory) cannot grow without bound.
         {
             bool noticed = false;
             while (!should_stop()) {
@@ -1631,13 +1735,13 @@ void GpuThread::run() {
 
         launched++;
 
-        // Host stays one batch ahead: sync + drain the older batch while the
-        // one we just launched keeps the GPU fed.
+        // Stay one batch ahead: collect the older batch's results while the
+        // one we just launched keeps the GPU busy.
         if (launched - harvested >= (uint64_t)nbuf)
             harvest((int)(harvested % (uint64_t)nbuf));
     }
 
-    // Drain any launched-but-not-yet-harvested batch (list tail or shutdown).
+    // Collect any launched-but-uncollected batches (end of a list, or shutdown).
     while (harvested < launched)
         harvest((int)(harvested % (uint64_t)nbuf));
 

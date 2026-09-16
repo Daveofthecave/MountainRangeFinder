@@ -1,30 +1,33 @@
 // cpu.cpp
-// CPU verifier: receives GPU pre-filtered candidates (BLOCK coordinates) and
-// applies the slow exact checks the GPU skips, in cheap-to-expensive order:
+// The CPU verifier: receives GPU pre-filtered candidates (block coordinates)
+// and applies the slow, exact checks the GPU skips, cheapest first:
 //
-//   * Climate stats (informational, default on): re-measures the GPU
-//     pipeline's claims with cubiomes in double precision -- core 0B-erosion
-//     disc coverage, windowed full-octave erosion minimum and continentalness
-//     maximum. Uses the same phyllotaxis disc samples and window grids as the
-//     GPU kernels, so the numbers are directly comparable.
-//   * NOT Dark Forest exclusion (recipe steps 58-59), evaluated with the
-//     biome tree of the target MC version (--mc; 1.21.4's pale_garden takes
-//     over part of dark_forest's climate niche, so the version matters).
-//   * Contiguous multi-climate blob fill (shared engine from probe.cpp:
-//     blob_fill over the BLOB_* field, 64-block lattice, +-48,000-block
-//     reach): the headline "megaregion size" score AND a hard gate at
+//   * Climate stats (informational, on by default): re-measures the GPU
+//     pipeline's claims with cubiomes in double precision, the core disc's
+//     erosion coverage, and the windowed full-stack erosion minimum and
+//     continentalness maximum. Uses the same phyllotaxis disc pattern and
+//     window grids as the GPU kernels, so the numbers are directly
+//     comparable.
+//   * Dark forest exclusion: samples the surface biome on a 64-block pitch
+//     over a 1,365-block radius, and rejects candidates whose core is 7% or
+//     more dark forest. Evaluated with the target MC version's biome tree
+//     (--mc; 1.21.4's pale garden takes over part of dark forest's climate
+//     niche, so the version matters).
+//   * The blob fill (shared engine with probe.cpp), which re-measures the
+//     GPU's claim in double precision over a +-48,000-block reach: the
+//     "megaregion size" measurement and the hard area gate at
 //     MIN_BLOB_AREA, plus the measured inscribed core radius and the
 //     edge-clipped flag.
-//   * Approximate surface height (recipe steps 7-8) via cubiomes'
-//     mapApproxHeight -- the same depth-based heuristic behind CV's "approx
-//     surface height".
-//   * Enrichment + score (shared engine: blob_enrich on the same fill):
-//     full-octave climates, weirdness texture, approx heights, biome census,
-//     neighbor-pair crossings, windowed best-subregion stats, and the
-//     composite score. This is the expensive bundle, so it runs last -- only
-//     for candidates that passed every gate. It also produces the headline
-//     x/z of the output row: the center of the best-pattern 1664-block
-//     window (the heart of the densest-packed peaks).
+//   * Approximate surface heights via cubiomes' mapApproxHeight, the same
+//     depth-based heuristic behind Cubiomes Viewer's approx-height layer.
+//   * Enrichment and scoring (shared engine: blob_enrich on the same fill):
+//     full-stack climates, weirdness texture, approximate heights, the
+//     biome census, neighbor-pair crossings, the windowed best-subregion
+//     stats, and the composite score. This is the expensive bundle, so it
+//     runs last, only for candidates that passed every gate. It also
+//     produces the headline x/z of the output row: the center of the
+//     best-pattern 1664-block window, the heart of the densest-packed
+//     peaks.
 
 #include "cpu.h"
 #include "common.h"
@@ -49,9 +52,10 @@
 #include <unordered_map>
 #include <mutex>
 
-// Climate thresholds mirrored from gpu.cu (raw noise units = CV display / 10000).
-// Keep these in sync with the GPU side when tuning.
-constexpr double CORE_COV_ERO_MAX  = -0.40;  // (2)  disc coverage, 0B erosion
+// Climate threshold mirrored from gpu.cu (raw noise units, i.e. the values
+// Cubiomes Viewer displays divided by 10,000). Keep it in sync with the GPU
+// side when tuning.
+constexpr double CORE_COV_ERO_MAX  = -0.40;  // the core disc's erosion coverage ceiling
 
 // Geometry mirrored from gpu.cu (quart units).
 constexpr int32_t CORE_DISC_R_Q   = CORE_BLOB_RADIUS / 4;      // 400
@@ -73,11 +77,11 @@ static inline int32_t disc_off_z(int k, int32_t r_q) {
 }
 
 // ---------------------------------------------------------------------------
-// Climate stats: re-measure the GPU's filter claims with cubiomes (double
-// precision), reusing the pre-seeded samplers of the shared MeasureCtx
-// (eroB = 0B truncation, eroF/contF = full octaves). The core-disc stat
-// samples the same CORE_COV_SAMPLES points as the GPU's KernelCoverage
-// (see noise_common.h), so the numbers line up exactly.
+// Climate stats: re-measure the GPU's filter claims with cubiomes in double
+// precision, reusing the pre-seeded samplers of the shared MeasureCtx (eroB
+// = truncated erosion, eroF/contF = full stacks). The core-disc stat samples
+// the same CORE_COV_SAMPLES points as the GPU's KernelCoverage (see
+// noise_common.h), so the numbers line up exactly.
 // ---------------------------------------------------------------------------
 struct ClimateStats {
     float ero_cov  = -1.0f; // fraction of the core disc with 0B erosion <= -0.4
@@ -116,7 +120,7 @@ static ClimateStats compute_climate_stats(MeasureCtx &ctx, int32_t bx, int32_t b
 }
 
 // ---------------------------------------------------------------------------
-// Approximate surface height (recipe steps 7-8).
+// The approximate surface height scan.
 // ---------------------------------------------------------------------------
 std::atomic_uint64_t g_rej_dark{0}, g_rej_area{0}, g_rej_core{0}, g_rej_height{0}, g_rej_dedup{0};
 
@@ -141,12 +145,11 @@ static bool height_scan(Generator *g, int32_t bx, int32_t bz, const VerifyConfig
         if (yi >= cfg.min_height && yi <= cfg.max_height) window_hit = true;
     };
 
-    // Outward square spiral with the radial clip, same pattern as the recipe.
-    // Full scan: no early exit, so ymin/ymax are the true extremes over the
-    // radius (the old version stopped at the first in-window sample, which
-    // made the reported "maxY" a first-hit value rather than a maximum).
-    // Affordable at candidate rates, and it makes both the pass rule and the
-    // report honest.
+    // An outward square spiral with a radial clip, scanned to completion with
+    // no early exit, so ymin/ymax are the true extremes over the radius. A
+    // first-hit exit would make the reported maximum just the first in-window
+    // sample; at candidate rates the full scan is affordable, and it keeps
+    // both the pass rule and the report in check.
     for (int32_t r = 0; r <= R_B; r += STEP_B) {
         for (int32_t t = -r; t <= r; t += STEP_B) {
             probe(bx + t, bz - r);
@@ -189,8 +192,8 @@ static bool verify_candidate(MeasureCtx &ctx, const VerifyConfig &cfg,
     // (Climate stats moved below the gates: only keepers ever print these,
     // so computing them for rejects is wasted work.)
 
-    // Recipe steps 58-59: NOT Dark Forest. Sample every 64 blocks inside a
-    // radius-1365 circle around the core blob; reject at >= 7% coverage.
+    // Dark forest exclusion. Sample the surface biome every 64 blocks inside
+    // a radius-1365 circle around the anchor; reject at 7% coverage or more.
     if (cfg.check_dark_forest) {
         const int32_t EXCL_RADIUS = ADJACENT_BLOB_RADIUS;
         const int32_t SAMPLE_STEP = 64;
@@ -215,10 +218,10 @@ static bool verify_candidate(MeasureCtx &ctx, const VerifyConfig &cfg,
             return false;
         }    }
 
-    // Contiguous multi-climate area: the megaregion size score and the hard
-    // gates. Shared engine (probe.cpp blob_fill): the same field definition
-    // and fill the GPU's KernelBlob used to earn emission, re-measured here
-    // in double precision.
+    // The contiguous multi-climate area: the megaregion size measurement and
+    // the hard gates. Shared engine (blob_fill from probe.cpp): the same
+    // field definition and fill the GPU's KernelBlob used to earn emission,
+    // re-measured here in double precision.
     BlobFill blob;
     bool have_blob = false;
     if (cfg.measure_blob) {
@@ -249,7 +252,7 @@ static bool verify_candidate(MeasureCtx &ctx, const VerifyConfig &cfg,
         have_blob = true;
     }
 
-    // Recipe steps 7-8: approx surface height window.
+    // Approximate surface height window.
     if (cfg.check_height) {
         int32_t ymin = 0, ymax = 0;
         if (!height_scan(&ctx.g, candidate.x, candidate.z, cfg, ymin, ymax)) {
@@ -273,17 +276,17 @@ static bool verify_candidate(MeasureCtx &ctx, const VerifyConfig &cfg,
         out.cont_max = cs.cont_max;
     }
 
-    // All gates passed: the enrichment bundle (full-octave climates,
-    // weirdness texture, approx heights, biome census, neighbor-pair
-    // crossings, windowed best-subregion stats) and the composite score.
-    // This is the expensive part -- running it last means it only ever runs
-    // on keepers. It also yields the headline coordinates: the center of the
-    // best-pattern 1664-block window inside the blob.
+    // All gates passed: the enrichment bundle (full-stack climates,
+    // weirdness texture, approximate heights, the biome census,
+    // neighbor-pair crossings, the windowed best-subregion stats) and the
+    // composite score. This is the expensive part, so it runs last, only on
+    // keepers. It also yields the headline coordinates: the center of the
+    // best-pattern 1664-block window inside the region.
     if (have_blob) {
         blob_enrich_best(ctx, blob, out.stats, cfg.enrich_phases);
         out.score = out.stats.score;
         // Headline = center of the coherent best-pattern 1664-block window
-        // (the most magic-like neighborhood), not the best-erosion window.
+        // (the most magic-like neighborhood), albeit not the best-erosion window.
         if (!std::isnan(out.stats.bw1664_sc)) {
             out.x = out.stats.bw1664_x;
             out.z = out.stats.bw1664_z;
@@ -305,20 +308,21 @@ static bool verify_candidate(MeasureCtx &ctx, const VerifyConfig &cfg,
 // ---------------------------------------------------------------------------
 // Result deduplication.
 //
-// KernelBlob can emit several candidates for the same seed when adjacent core
+// KernelBlob can emit several candidates for the same seed when adjacent
 // anchors sit on one megaregion: each fill measures the same connected field
-// and reports it from a slightly different centroid (observed pairs ~1.5k and
-// ~3.4k blocks apart with near-identical areas). We keep one point per seed
+// and reports it from a slightly different centroid (observed pairs 1.5k and
+// 3.4k blocks apart with near-identical areas). One point is kept per seed
 // per dedup radius.
 //
-// The authoritative check happens after verification and atomically with the
-// recording. The old code checked before verification and recorded after, so
-// two threads verifying same-seed candidates concurrently both passed the
-// check and both recorded -- a check-then-act race. Verification is cheap
-// relative to the idle CPU pool, so an occasional wasted verify beats a dupe.
+// The authoritative check happens after verification, atomically with the
+// recording. Checking before verification and recording after would be a
+// check-then-act race: two threads verifying same-seed candidates
+// concurrently would both pass the check and both record. Verification is
+// cheap relative to the idle CPU pool, so an occasional wasted verify beats
+// a duplicate.
 //
 // Dedup keys on the candidate anchor, while the output file stores the
-// window-center headline coords; the 8000-block default radius absorbs the
+// window-center headline coords; the 8,000-block default radius absorbs the
 // (few-km) shift between the two when resuming from an existing output file.
 // ---------------------------------------------------------------------------
 static std::mutex g_dedup_mutex;
@@ -391,9 +395,9 @@ void CpuThread::run() {
         // In aggregate mode (search / --seeds) this is skipped: every verified
         // row flows to main.cpp's aggregator, which clusters same-seed rows
         // and keeps the highest-scoring one per cluster. That subsumes
-        // first-claim-wins dedup -- the runner-up rows were already fully
-        // verified anyway, so the CPU cost is identical and the output rows
-        // get strictly better (and reproducible across reruns).
+        // dedup: the runner-up rows were already fully verified anyway, so
+        // the CPU cost is identical and the output rows come out strictly
+        // better (and reproducible across reruns).
         if (!cfg.aggregate &&
             !dedup_claim(cfg.dedup_radius, candidate.seed, candidate.x, candidate.z)) {
             g_rej_dedup.fetch_add(1, std::memory_order_relaxed);

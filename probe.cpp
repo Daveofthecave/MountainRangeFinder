@@ -1,28 +1,39 @@
 // probe.cpp
-// Shared feature measurement engine + gates-free prober.
+// The measurement engine, shared by the CPU verifier (cpu.cpp) and the
+// --probe mode driver at the bottom of this file. Both paths measure the
+// same field with the same code, so their numbers are directly comparable:
 //
-// The engine (blob_fill / blob_enrich / compute_score, declared in probe.h)
-// is used by both the CPU verifier (cpu.cpp) and --probe mode:
+//   1. blob_fill flood-fills the connected region around an anchor on a
+//      64-block lattice, out to +-48,000 blocks. A cell joins the region
+//      if it passes the shared climate field (the BLOB_* thresholds in
+//      common.h: low truncated erosion, inland continentalness, temperate
+//      temperature). If the anchor cell itself fails, the search nudges
+//      out two lattice rings for a valid start.
+//   2. blob_enrich measures the region on every other lattice cell (a
+//      128-block pitch): full-stack climate stats, weirdness texture,
+//      approximate heights, a 9-bin biome census, neighbor-pair crossings,
+//      and the sliding-window stats described further down.
+//   3. compute_score folds all of that into the composite score.
 //
-//   1. blob_fill: fill the connected multi-climate blob (the shared BLOB_*
-//      field, 64-block lattice, +-48,000-block reach) from the anchor,
-//      nudging out two lattice rings if the anchor cell itself fails.
-//   2. blob_enrich: measure the blob on the stride-2 sublattice (128-block
-//      pitch):
-//        - full-octave erosion mean/p10/min, full-octave continentalness
-//          mean/max, full weirdness texture (ridge/valley fractions and
-//          ridge/valley crossing fractions between 128-block neighbors),
-//          approximate-height min/max/mean/p90 + relief/high/low fractions,
-//          the 9-bin surface census, and the windowed best-subregion stats
-//          (896-/1664-block square windows, via 2D prefix sums)
-//        - the composite score (compute_score) over all of the above
+// Vocabulary used throughout this file:
 //
-// --probe mode (run_probe) additionally measures, per candidate:
-//   - blob-field means over all cells (0B erosion, 0B temperature)
-//   - coastal stats: distance to shore-ish/deep-ocean-ish cells and the mean
-//     0B erosion of coastal blob cells (low coastal erosion ~ cliffy shores)
-//   - polygon stats on a bounded grid inside an optional user polygon
-// Nothing in probe mode rejects a candidate; it only measures.
+//   * the sublattice: the measurement grid at a 128-block pitch, every
+//     other lattice cell.
+//   * a phase: which of the four interleaved sublattices is measured (the
+//     grid can start offset by 64 blocks on either axis). blob_enrich_best
+//     measures all four and keeps the best score.
+//   * a window: a square of sublattice cells (896, 1,664, or 3,200 blocks
+//     across) slid over the region to find its best neighborhood.
+//   * the headline: the coordinates an output row reports for a region,
+//     the center of its best 1,664-block window.
+//   * the reference region: the known-good seed in magic_seed.txt, used
+//     as a canary for pipeline and scoring changes. Several thresholds
+//     below were centered on its measured values; where that matters, the
+//     comments say which magic_seed.txt columns to re-read.
+//
+// --probe mode (run_probe) skips every gate and only measures: the same
+// bundle as above, plus blob-field means over all cells, coastal stats,
+// and stats inside an optional user-drawn polygon.
 
 #include "probe.h"
 #include "common.h"
@@ -54,32 +65,33 @@ namespace {
 // Geometry / tuning constants
 // ---------------------------------------------------------------------------
 constexpr int32_t BLOB_STEP  = 64;               // blocks per lattice cell
-constexpr int32_t BLOB_MAX_R = 48000;            // reach, blocks
-constexpr int32_t BLOB_HALF  = BLOB_MAX_R / BLOB_STEP;  // 750
+constexpr int32_t BLOB_MAX_R = 48000;            // how far the fill can reach from the anchor
+constexpr int32_t BLOB_HALF  = BLOB_MAX_R / BLOB_STEP;  // 750 cells
 constexpr int32_t BLOB_DIM   = 2 * BLOB_HALF + 1;       // 1501
 
-// Stride-2 sublattice for the expensive stats (128-block pitch).
+// The expensive stats are measured on every SUB-th lattice cell, i.e. at a
+// 128-block pitch.
 constexpr int32_t SUB = 2;
 
-// Coarse coast scan: 256-block pitch over +-24,000 blocks.
+// The coarse coastal scan: a 256-block pitch out to +-24,000 blocks.
 constexpr int32_t COAST_STEP  = 256;
 constexpr int32_t COAST_MAX_R = 24000;
-constexpr int32_t COAST_HALF  = COAST_MAX_R / COAST_STEP; // 93 (dim 187)
+constexpr int32_t COAST_HALF  = COAST_MAX_R / COAST_STEP; // 93 (the grid is 187 wide)
 
-// Continentalness (1B truncation) coast thresholds, raw noise units.
-constexpr double CONT_SHORE = -0.19; // land/ocean boundary
-constexpr double CONT_DEEP  = -0.45; // deep-ocean-ish
+// Coastal thresholds for truncated continentalness, in raw noise units.
+constexpr double CONT_SHORE = -0.19; // the land/ocean boundary
+constexpr double CONT_DEEP  = -0.45; // deep-ocean territory
 
-// Weirdness: peaks-and-valleys projection and classification thresholds.
-// PV = 1 - 3*||w| - 2/3|; PV -> +1 on ridge lines (peaks), PV -> -1 at w = 0
-// (river/valley axis).
+// Weirdness is read through the peaks-and-valleys projection,
+// PV = 1 - 3*||w| - 2/3|: it approaches +1 on ridge lines (peaks) and -1 at
+// w = 0 (the valley and river axis).
 constexpr double PV_RIDGE  = 0.85;
 constexpr double PV_VALLEY = -0.50;
 
-// Approximate-height relief stats, in blocks.
-constexpr float H_RELIEF = 96.0f;   // neighbor-pair drop counted as "relief"
+// Height scale for the relief stats, in blocks.
+constexpr float H_RELIEF = 96.0f;   // a neighbor-pair drop this big counts as relief
 constexpr float H_HIGH   = 200.0f;  // high ground
-constexpr float H_LOW    = 116.0f;  // valley-floor-ish (you observed ~y100)
+constexpr float H_LOW    = 116.0f;  // valley-floor territory (measured valley floors sit near y100)
 
 constexpr double NaN = std::numeric_limits<double>::quiet_NaN();
 
@@ -92,9 +104,9 @@ struct ProbeJob {
     std::vector<std::pair<double, double>> poly; // block coords; may be empty
 };
 
-// Whitespace tokenization used to locate seed/x/z inside a row. Rows may
-// lead with a decimal score column (new output format), so the seed is the
-// first integer-like token, followed by two more integers (x, z).
+// Whitespace tokenization used to locate the seed/x/z inside a row. Output
+// rows lead with a decimal score column, so the seed is the first
+// integer-like token, followed by two more integers (x, z).
 struct Tok { const char *p; int len; };
 
 int tokenize(const char *line, Tok *toks, int maxtoks) {
@@ -227,28 +239,33 @@ inline float percentile(std::vector<float> &v, float q) {
 }
 
 // ---------------------------------------------------------------------------
-// Windowed "best sub-region" stats, via 2D prefix sums over the stride-2
-// sublattice (128-block pitch; ev/hv/mv are the per-cell value arrays built
-// by blob_enrich, indexed over the blob's bounding box).
+// Windowed best-subregion stats, computed with 2D prefix sums over the
+// sublattice (ev/hv/mv and friends are the per-cell value arrays built by
+// blob_enrich, indexed over the region's bounding box).
 //
-// Why: whole-blob means dilute the good part. The magic seed's cool region is
-// a ~2000x3000-block sub-region of a 30.4M-block blob, and its hand-drawn
-// polygon stats were dramatically stronger than its blob-wide averages. The
-// discriminating question is "does the blob contain a spectacular
-// neighborhood?", not "is the blob good on average?" -- so slide (2R+1)-cell
-// square windows over the blob and keep the best of each stat.
+// The reason for windows at all: a big region's best part is usually a
+// sub-region, and whole-region averages dilute it. The reference region's
+// highlight is a roughly 2000x3000-block neighborhood inside a 30M-block
+// region, and measurements confined to that neighborhood are dramatically
+// stronger than its region-wide averages. So the question these stats
+// answer is not "is the region good on average?" but "does the region
+// contain a spectacular neighborhood?" Every (2R+1)-cell square window
+// over the region is scored, and the best of each stat is kept.
 //
-// Prefix sums in one breath: with S[y][x] = sum of all cells at (0..x, 0..y),
-// any rectangle's sum costs four reads:
+// Prefix sums make that affordable. With S[y][x] = the sum of all cells in
+// rows 0..y, columns 0..x, any rectangle's sum costs four reads:
 //   sum(x0..x1, y0..y1) = S[y1][x1] - S[y0-1][x1] - S[y1][x0-1] + S[y0-1][x0-1]
-// so scoring every window of the blob is O(1) per window after an O(N) build.
-// A window is only trusted when at least half of its cells are inside the
-// blob -- fringe slivers would otherwise win on artifacts.
+// so after one O(N) build, every window costs O(1). A window counts only
+// when at least half of its cells lie inside the region; thin fringe
+// slivers would otherwise win on artifacts.
 // ---------------------------------------------------------------------------
+
+// Window half-widths, in sublattice cells. R896 = 3 means a 7x7-cell
+// window, 896x896 blocks; R1664 = 6 means 13x13 cells, 1664x1664 blocks.
 struct WinHalf {
-    static constexpr int32_t R896  = 3;  // 7x7  sublattice cells =  896 x  896 blocks
-    static constexpr int32_t R1664 = 6;  // 13x13 sublattice cells = 1664 x 1664 blocks
-    static constexpr double  MIN_COVER = 0.5;
+    static constexpr int32_t R896  = 3;
+    static constexpr int32_t R1664 = 6;
+    static constexpr double  MIN_COVER = 0.5; // a window must be at least half inside the region
 };
 
 template <typename T>
@@ -315,37 +332,47 @@ WinResult best_windows(int32_t R, int32_t SW, int32_t SH,
 }
 
 // ---------------------------------------------------------------------------
-// Coherent best-pattern windows (score v3.1)
+// Coherent best-pattern windows.
 //
-// Each window gets one combined pattern score and we keep the argmax window's
-// full stat vector -- plus its center, which becomes the headline coordinate.
+// Each window gets one combined pattern score from its own ingredients
+// (window_pattern_score below), and the argmax window's full stat vector
+// is kept, along with its center, which becomes the headline coordinate.
 //
-// Failure mode fixed in v3.1: a mountain range bordering the sea has huge
-// dh/hstd (cliff face -> water), so shoreline windows used to win the argmax
-// and the headline coords landed in the ocean. Now oceanic-biome cells are
-// counted per window; windows above OCN_SKIP are excluded and the rest are
-// penalized, and windows hanging off the blob's edge (cover < 0.85) lose
-// credit. Two more coherent terms reward the magic juxtaposition directly:
-// hi = frac of cells at y>=200 (tall mass), lo = frac of inland cells at
-// y<=63 (sea-level valley floors; oceanic cells don't count toward lo).
+// Two guards keep the argmax in check. The first is about the sea: a range
+// bordering the ocean produces huge height differences (cliff face to
+// water), so without a guard, shoreline windows win and the headline lands
+// in the ocean. Oceanic cells are therefore counted per window, windows
+// above OCN_SKIP are excluded outright, and the rest are penalized. The
+// second guard is about the region's edge: windows hanging off it (cover
+// below 0.85) lose credit in proportion to how far they dangle. Two more
+// terms reward the signature juxtaposition directly: hi, the share of
+// cells at y >= 200 (tall ground), and lo, the share of inland cells at
+// y <= 63 (sea-level valley floors; ocean cells never count toward it).
 //
-// WINDOW_PATTERN references (TUNE): recentered on the magic seed's measured
-// bw1664 values (dh 42.7-46.2, hstd 44.8-50.8). To recenter: --verify
-// magic_seed.txt and read the bw1664Dh/bw1664hStd/bw1664Hi/bw1664Lo columns.
-// If you change WREF_HI/WREF_LO, change the matching references in
-// score_aspects (z_bwhi / z_bwlo) to match.
+// Tuning: the reference constants below were centered on the reference
+// region's measured best-window values (bw1664Dh 42.7-46.2, bw1664hStd
+// 44.8-50.8 across its rows in magic_seed.txt). To re-center, re-run
+// --verify on magic_seed.txt and read the bw1664Dh / bw1664hStd / bw1664Hi
+// / bw1664Lo columns. If you change WREF_HI or WREF_LO, change the matching
+// references in score_aspects (z_bwhi, z_bwlo) to follow.
 // ---------------------------------------------------------------------------
-constexpr double WREF_DH   = 36.0;  // window mean |dh| (blocks)
-constexpr double WREF_HSTD = 40.0;  // window height std (blocks)
-constexpr double WREF_ERO  = -0.90; // window mean full-octave erosion
-constexpr double WREF_HI   = 0.10;  // window y>=200 fraction
-constexpr double WREF_LO   = 0.02;  // window inland y<=63 fraction
-constexpr double OCN_SKIP  = 0.15;  // windows with more ocean than this never win
+constexpr double WREF_DH   = 36.0;  // reference for mean neighbor height difference (blocks)
+constexpr double WREF_HSTD = 40.0;  // reference for height spread (blocks)
+constexpr double WREF_ERO  = -0.90; // reference for mean full-stack erosion
+constexpr double WREF_HI   = 0.10;  // reference for high-ground share
+constexpr double WREF_LO   = 0.02;  // reference for sea-level valley-floor share
+constexpr double OCN_SKIP  = 0.15;  // windows with more ocean than this are excluded outright
 
+// One window's pattern score: each ingredient is compared against its
+// reference constant above, weighted, and summed. Higher means a closer
+// match to the target pattern: steep (dh), height-varied (hstd), with high
+// ground (hi) and valley floors (lo) packed in together, deep erosion
+// beneath it (ero), mountain-biome cover (mtn), and no sea in the frame
+// (ocn).
 static inline double window_pattern_score(double ero_m, double h_sd,
         double dh_m, double mtn_f, double hi_f, double lo_f, double ocn_f,
         double cover) {
-    const double mtn_cap = mtn_f > 0.62 ? 0.62 : mtn_f; // massifs don't keep gaining
+    const double mtn_cap = mtn_f > 0.62 ? 0.62 : mtn_f; // saturates: past 62% cover, more doesn't help
     double hi_z = (hi_f - WREF_HI) / 0.10;
     hi_z = hi_z > 2.0 ? 2.0 : (hi_z < -1.5 ? -1.5 : hi_z);
     double lo_z = (lo_f - WREF_LO) / 0.03;
@@ -363,6 +390,9 @@ static inline double window_pattern_score(double ero_m, double h_sd,
          - edge_pen;
 }
 
+// The full ingredient list of the single best-scoring window at one size
+// tier, plus its center. NaN fields mean no eligible window was measured
+// (e.g. the region is smaller than the window).
 struct BwResult {
     double sc = NaN, ero = NaN, hmean = NaN, hstd = NaN, dh = NaN, mtn = NaN;
     double hifrac = NaN, lofrac = NaN, ocn = NaN, dark = NaN;
@@ -538,10 +568,11 @@ void windowed_blob_stats(const BlobFill &blob, int32_t bx, int32_t bz,
     if (have_hl) { hx = b1664.x; hz = b1664.z; }
     else if (!std::isnan(b896.sc)) { hx = b896.x; hz = b896.z; have_hl = true; }
 
-    // Worst local dark-forest blotch near the headline: max DF fraction over
-    // 896-block windows whose centers lie within 1792 blocks of the headline.
-    // A real dark-forest blob is ~50%+ DF locally, so this separates "two
-    // thick blobs" from "7% politely dispersed".
+    // The worst local dark-forest patch near the headline: the maximum
+    // dark-forest share over 896-block windows whose centers lie within
+    // 1792 blocks of the headline. A genuine dark-forest blob is 50%+
+    // locally, so this separates a couple of thick patches from a light
+    // dusting spread across the region.
     if (have_hl) {
         const int32_t R = 3;
         const int64_t NEAR2 = 1792LL * 1792;
@@ -561,9 +592,11 @@ void windowed_blob_stats(const BlobFill &blob, int32_t bx, int32_t bz,
         o.max_dark_896_near = best;
     }
 
-    // Superlevel-set stats of the 1664-block window score field: "how much of
-    // this blob is actually magic country". The threshold rises with the best
-    // window, so a single lucky window cannot inflate it.
+    // Superlevel-set stats of the 1,664-block window score field: how much
+    // of the region is window-score material at all. qual_n counts the
+    // windows above the threshold; qual_area measures the largest connected
+    // patch of them. The threshold rises together with the best window's
+    // score, so one lucky window cannot inflate either number.
     if (!std::isnan(b1664.sc)) {
         const float T = (float)std::max(0.75, 0.35 * b1664.sc);
         const int64_t N = (int64_t)SW * SH;
@@ -617,9 +650,10 @@ void windowed_blob_stats(const BlobFill &blob, int32_t bx, int32_t bz,
         }
     }
 
-    // Ocean proximity, in-blob: chamfer distance transform over the oceanic
-    // biome mask on the sublattice; the headline's distance in blocks. Open
-    // ocean beyond the blob edge is invisible here -- ocean_spiral covers it.
+    // Ocean proximity inside the region: a chamfer distance transform over
+    // the oceanic-biome mask on the sublattice, read at the headline and
+    // reported in blocks. Open ocean past the region's edge is invisible
+    // to this scan; ocean_spiral_scan covers that side.
     if (have_hl) {
         const size_t N = (size_t)SW * SH;
         thread_local std::vector<float> dt;
@@ -673,15 +707,18 @@ void windowed_blob_stats(const BlobFill &blob, int32_t bx, int32_t bz,
 }
 
 // ---------------------------------------------------------------------------
-// Setting (scenery) feature detection -- the unified successor to icing +
-// charm. Everything is measured relative to the headline coordinate (the
-// point the output row teleports to), after the windowed stats have chosen it.
+// Setting (scenery) feature detection: rivers, lakes, fjords, cliffs, and
+// other neighbors that make a region's surroundings interesting.
+// Everything here is measured relative to the headline coordinate (the
+// point the output row teleports to), chosen by the windowed stats above.
 // ---------------------------------------------------------------------------
 
-// 16-ray cast from the headline, 128-block pitch, out to 4800 blocks. A ray
-// that dips into ocean-ish continentalness and comes back to land crossed a
-// fjord / inlet / inland sea; a ray that never comes back ends in open ocean.
-// Ocean hits are bucketed into 8 sky sectors to detect isthmus geometry.
+// Sixteen rays cast from the headline at a 128-block pitch, out to 4,800
+// blocks, reading truncated continentalness along the way. A ray that dips
+// into ocean-like continentalness and comes back to land has crossed a
+// fjord, inlet, or inland sea; a ray that never comes back ends in open
+// ocean. Ocean hits are also bucketed into eight compass sectors, which is
+// how isthmus geometry (ocean in opposite directions) is detected.
 struct VicinityRays {
     double sea_min = NaN;   // nearest ocean-ish hit, blocks
     int    open_nonfrz = 0; // rays ending in non-frozen ocean at 4800 blocks
@@ -751,7 +788,7 @@ static void setting_features(MeasureCtx &c, const BlobFill &blob,
     };
 
     // -- Isolated river lakes: small interior river components on valley
-    // floors with tall walls nearby, in an otherwise river-scarce blob.
+    // floors with tall walls nearby, in an otherwise river-scarce region.
     {
         const bool river_scarce = !std::isnan(o.bio[CEN_RIVER]) && o.bio[CEN_RIVER] <= 0.05;
         thread_local std::vector<uint8_t> rseen;
@@ -839,8 +876,8 @@ static void setting_features(MeasureCtx &c, const BlobFill &blob,
                                     : std::numeric_limits<double>::quiet_NaN();
     }
 
-    // -- Large gem forests: biggest same-biome components of old-growth
-    // taiga / cherry grove inside the blob.
+    // -- Large old-growth taiga and cherry grove patches: the biggest
+    // connected same-biome component of each inside the region.
     {
         thread_local std::vector<uint8_t> gseen;
         gseen.assign((size_t)W2 * H2, 0);
@@ -889,8 +926,11 @@ static void setting_features(MeasureCtx &c, const BlobFill &blob,
         o.vic_isthmus   = vr.isthmus ? 1.0 : 0.0;
     }
 
-    // -- Oddball-biome vicinity scan: 256-block pitch square rings out to
-    // 4800, skipping points inside the blob (the census covers those).
+    // -- Vicinity biome scan: square rings at a 256-block pitch out to
+    // 4,800 blocks, counting the interesting neighboring biomes (eroded
+    // badlands, mushroom fields, flower forest, cherry grove, old-growth
+    // taiga). Points inside the region are skipped because the census covers
+    // those.
     {
         constexpr int32_t VSTEP = 256, VRMAX = 4800;
         double badl = 0, badl_oth = 0, mushb = 0, flow = 0, vch = 0, vmtg = 0;
@@ -1019,13 +1059,12 @@ BlobFill blob_fill(MeasureCtx &c, const VerifyConfig &cfg, int32_t bx, int32_t b
     }
 
     if (cfg.close1) {
-        // True one-cell morphological closing: dilate (an unset cell with ANY
-        // set 4-neighbor joins) over a mask with a 2-cell margin, then erode
-        // (drop cells adjacent to any unset 4-neighbor). The dilation ring is
-        // stripped back off, so original blob cells always survive and the
-        // measured area can only grow by bridged 1-cell gaps -- never shrink.
-        // (Wave-1 bug fixed: the >=3-dilate / <4-erode variant shaved the
-        // whole boundary, silently tightening the area gate.)
+        // One-cell morphological closing: dilate (an unset cell with any set
+        // 4-neighbor joins) over a mask with a 2-cell margin, then erode
+        // (drop cells adjacent to any unset 4-neighbor). The dilation ring
+        // is stripped back off by the erosion, so original region cells
+        // always survive, and the measured area can only grow by bridged
+        // one-cell gaps, never shrink.
         const int32_t W = out.maxI - out.minI + 5;
         const int32_t H = out.maxJ - out.minJ + 5;
         thread_local std::vector<uint8_t> mask, dil;
@@ -1071,8 +1110,10 @@ BlobFill blob_fill(MeasureCtx &c, const VerifyConfig &cfg, int32_t bx, int32_t b
 
     out.area = (int64_t)out.cells.size() * BLOB_STEP * BLOB_STEP;
 
-    // Two-pass chamfer distance transform over the blob's bounding box (+1
-    // cell margin). maxdt = inscribed core radius in lattice cells.
+    // The inscribed core radius: a two-pass chamfer distance transform over
+    // the region's bounding box (plus a 1-cell margin). The largest value
+    // on the map is the radius, in lattice cells, of the biggest circle
+    // that fits entirely inside the region.
     {
         const int32_t W = out.maxI - out.minI + 3;
         const int32_t H = out.maxJ - out.minJ + 3;
@@ -1165,33 +1206,40 @@ BlobFill blob_fill(MeasureCtx &c, const VerifyConfig &cfg, int32_t bx, int32_t b
 // 10.Run this command to apply your changes:
 //      make clean && make
 // ---------------------------------------------------------------------------
-// NaN-safe weighted average of one aspect's terms. An aspect with no measured
-// terms at all fails low (-3) rather than being silently ignored.
+
+// A NaN-safe weighted average of one aspect's terms. If an aspect has no
+// measured terms at all, it scores low (-3) rather than being silently
+// skipped, so missing data can never inflate a score.
 struct AspectAcc {
     double sum = 0.0, wsum = 0.0;
     void add(double v, double w) { if (!std::isnan(v)) { sum += w * v; wsum += w; } }
     double get() const { return wsum > 0.0 ? sum / wsum : -3.0; }
 };
 
-// The gated aspects (amp/tex/frag/depth here; dark joins the min() in
-// compute_score via score_dark_aspect). A pure linear score lets one axis
-// compensate for another -- that is how "dissected but small" outranked
-// "tall AND deep AND dissected". The magic-region signature is a
-// conjunction, so the aspects are measured separately and the weakest one
-// dominates the final score:
+// The gated aspects. amp, tex, frag, and depth are computed here; the dark
+// forest aspect joins them in compute_score via score_dark_aspect. The
+// five describe the region's core pattern along separate axes, and a great
+// region has to be good at all of them at once. A single linear score
+// would let one axis compensate for another (that's how "small but
+// dissected" could outrank "tall, deep, AND dissected"), so the final
+// score is built on the weakest aspect:
 //
-//   amp  = tall, prominent peaks (h_max, peak_prom, w896_hstd_max)
-//   tex  = fine-grained ruggedness + valley-network density
-//          (dh_mean, vcross, peak_density)
-//   frag = packed individual peaks, not one plateau massif
-//          (high_comps up, high_largest down)
+//   amp   = tall, prominent peaks
+//           (hMax, peakProm, bw1664hStd, bw1664Hi)
+//   tex   = fine-grained ruggedness and valley-network density
+//           (bw1664Dh, bw896Dh, vcross)
+//   frag  = many packed individual peaks rather than one plateau massif
+//           (highComps up, highLargest down)
+//   depth = deep valley floors and gorge adjacency
+//           (w896hMeanMin, hMin, bw1664Lo, gorgeFrac)
 //
-// The z-score references are the pooled constants of the 2026-08-24
-// calibration (the same numbers the legacy table below uses). w896_hstd_max
-// uses a physical scale (blocks): an in-window std of 15 is ordinary, 30+
-// means peaks and valleys packed into one neighborhood. If the magic seed's
-// amp aspect comes out low, recenter that constant to ~0.6x the magic seed's
-// measured w896hStdMax column.
+// The reference constants come from the calibration set (the same fit that
+// produced the consensus table in compute_score). The window-contrast
+// reference is in physical units (blocks): an in-window height spread of
+// 15 is ordinary, while 30+ means peaks and valleys packed into one
+// neighborhood. If the reference region's amp aspect ever reads low,
+// re-center that constant near 0.6x its measured w896hStdMax column in
+// magic_seed.txt.
 void score_aspects(const EnrichStats &e, double &amp, double &tex, double &frag, double &depth) {
     const double z_hmax   = (e.h_max        - 242.078)  / 10.348;
     const double z_prom   = (e.peak_prom    - 36.9412)  / 2.00566;
@@ -1205,15 +1253,19 @@ void score_aspects(const EnrichStats &e, double &amp, double &tex, double &frag,
     const double z_bwhi   = (e.bw1664_hifrac - 0.10)    / 0.10;
     const double z_bwdh   = (e.bw1664_dh     - 36.0)    / 6.0;
     const double z_bwdh9  = (e.bw896_dh      - 36.0)    / 6.0;
-    // Depth: the blob's deepest 896-block bowl (valley floor), how close the
-    // blob gets to sea level, and sea-level valley floors inside the pattern
-    // window itself. (v3 used the pattern window's mean height -- but that
-    // window sits on the peaks, so the magic region read as "shallow".)
+    // Depth: the region's deepest 896-block bowl (its valley floor), how
+    // close the region gets to sea level at all, the share of sea-level
+    // valley floors inside the best window, and gorge adjacency. Measuring
+    // depth from the window's mean height does not work: the best window
+    // sits on the peaks, which makes even a deeply cut region read as
+    // shallow.
     const double z_bowl   = (90.0 - e.w896_hmean_min)   / 12.0;
     const double z_hmin   = (90.0 - e.h_min)            / 20.0;
     const double z_bwlo   = (e.bw1664_lofrac - 0.02)    / 0.03;
-    // Gorge adjacency: narrow deep floors beside tall walls. TUNE: recenter
-    // on the magic seed's gorgeFrac column after re-verifying the corpus.
+    // Gorge adjacency: the share of low cells with a tall wall within 256
+    // blocks, i.e. narrow deep floors beside tall walls. Tuning: re-center
+    // the reference on the reference region's gorgeFrac column after
+    // re-verifying the corpus.
     const double z_gorge  = (e.gorge_frac - 0.25)       / 0.10;
 
     AspectAcc a, t, f, d;
@@ -1225,9 +1277,10 @@ void score_aspects(const EnrichStats &e, double &amp, double &tex, double &frag,
     amp = a.get(); tex = t.get(); frag = f.get(); depth = d.get();
 }
 
-// Extent: the "I wish it were bigger" axis. blob area (saturating), inscribed
-// core width, and the pattern score of the best 3200-block window -- a window
-// that large can only score well if the pattern persists at scale.
+// Extent: how large the pattern is. Combines the region's area
+// (with saturation, so outliers stop gaining), its inscribed
+// core width, and the pattern score of the best 3,200-block window, which
+// can only score well if the pattern holds up at scale.
 double score_extent(int64_t area, int32_t core_cells, const EnrichStats &e) {
     double z_area = ((double)area / 1e6 - 20.0) / 4.0;
     z_area = z_area > 3.5 ? 3.5 : (z_area < -2.0 ? -2.0 : z_area); // cap 2.5 -> 3.5
@@ -1235,11 +1288,13 @@ double score_extent(int64_t area, int32_t core_cells, const EnrichStats &e) {
     x.add(z_area, 0.25);
     x.add(((double)core_cells - 21.0) / 4.0, 0.15);
     x.add(e.bw3200_sc, 0.35);
-    // "How much of the blob is magic" (superlevel-set area of the 1664-tier
-    // window score field), how consistently the pattern shows up (scQ90: the
-    // 90th-percentile window score -- the consistency axis the 628k-row
-    // separation table confirmed at d = +0.98, against "one lucky window"
-    // blobs), and "how big is the connected mountain range".
+    // Three more extent signals: qual_area, how much of the region scores
+    // like its best part (the superlevel set of the 1,664-block window
+    // score field); scQ90, the 90th-percentile window score, which measures
+    // how consistently the pattern shows up (in the calibration corpus it
+    // was one of the strongest separators, Cohen's d = +0.98, precisely
+    // because it punishes one-lucky-window regions); and mtnCompM, the
+    // size of the largest connected mountain-biome stretch.
     if (!std::isnan(e.qual_area)) {
         double zq = ((double)e.qual_area / 1e6 - 2.0) / 1.0;
         x.add(zq > 2.5 ? 2.5 : (zq < -2.0 ? -2.0 : zq), 0.15);
@@ -1256,30 +1311,30 @@ double score_extent(int64_t area, int32_t core_cells, const EnrichStats &e) {
     return x.get();
 }
 
-// Negative aspect: dark forest in the best pattern window (bw1664Dark), not
-// the r=1152 headline ring. The ring over-counted peripheral DF and buried
-// good seeds whose dark forest sits on the blob's edges, not at the core.
-// The zombie's two sizable blobs landed inside its best window (0.071); the
-// magic seed's SE patch sits at the window's edge (0.036). The ring stays
-// in the output as a diagnostic and as a safety net at extreme levels only.
+// The dark-forest aspect, measured on the best pattern window
+// (bw1664_dark), not on the ring around the headline. A ring over-counts
+// peripheral dark forest and would penalize good regions whose dark forest
+// sits at the region's edges rather than its core. The ring stays in the
+// output as a diagnostic, and as a safety net at extreme levels below.
 double score_dark_aspect(const EnrichStats &e) {
     if (std::isnan(e.bw1664_dark)) return 0.0;
-    // Window DF: 5% is neutral (z=0), then -1 per 0.5% beyond: 5.5% -> -1,
-    // 6% -> -2, 6.5% -> -3, 7%+ clamps at -4. The steep cliff is
-    // deliberate: that's where your taste flips (magic 3.6% = love,
-    // zombie 7.1% = hate).
+    // Window share: 5% is neutral, then one notch per extra 0.5% (5.5% ->
+    // -1, 6% -> -2, 6.5% -> -3), clamped at -4 from 7% on. The cliff is
+    // deliberately steep: the reference region measures 3.6% dark forest
+    // in its best window and reads as clean, while a rejected calibration
+    // seed measured 7.1% inside its best window and read as infested.
     const double z_win = (0.05 - e.bw1664_dark) / 0.005;
-    // Safety net: a headline ring with > 25% DF means the area around the
-    // reported point is DF-dominated; veto even if the best window happens
-    // to sit in a clear patch (a real DF-blob seed, not a peripheral-DF one).
+    // The safety net: a headline ring above 25% dark forest means the area
+    // around the reported point is dark-forest-dominated, and the seed is
+    // vetoed even if the best window happens to sit in a clear patch.
     const double z_ring = std::isnan(e.dark_core_frac) ? 1.5
                           : (0.25 - e.dark_core_frac) / 0.05;
     const double z = std::min(z_win, z_ring);
     return z > 1.5 ? 1.5 : (z < -4.0 ? -4.0 : z);
 }
 
-// Nearest measured ocean to the headline, whichever probe saw it closer.
-// Retired by the unified setting bonus; kept for reference.
+// The nearest measured ocean to the headline, whichever probe saw it
+// closest. Not used by the current score; kept for reference.
 [[maybe_unused]] static double ocean_distance(const EnrichStats &e) {
     const double nan = std::numeric_limits<double>::quiet_NaN();
     double d = nan;
@@ -1289,11 +1344,9 @@ double score_dark_aspect(const EnrichStats &e) {
     return d;
 }
 
-// Bounded "setting" bonus in [0, 0.5]: ocean near (but not inside the pattern
-// window of) the blob -- inland seas, cliffy coasts, isthmuses. Capped low so
-// it can only ever break ties, never rescue a weak core.
-// Retired: superseded by the feature-detected, core-gated setting bonus
-// below. Kept for reference.
+// The earlier ocean-proximity bonus: a small score lift for ocean near
+// (but not inside) the region's best window. Not used by the current
+// score; setting_parts() below took over this job. Kept for reference.
 [[maybe_unused]] static double icing_score(double odist, double ocn_frac) {
     if (std::isnan(odist) || std::isnan(ocn_frac)) return 0.0;
     if (ocn_frac > 0.08) return 0.0; // window is already a sea cliff; not "icing"
@@ -1307,14 +1360,15 @@ double score_dark_aspect(const EnrichStats &e) {
 }
 
 // ---------------------------------------------------------------------------
-// The unified "setting" (scenery) bonus -- successor to the icing + charm
-// pair. Instead of generic proximity flags, it detects actual features:
-// waterscapes (proximity ramp + fjord/inlet excursions + vast non-frozen open
-// ocean), isthmus geometry, coastal cliffs, isolated river lakes in the
-// valleys, and oddball vicinity biomes (eroded badlands, mushroom island,
-// flower forest, big cherry grove / mega taiga). Capped per group and overall,
-// and gated on core quality: a weak core pattern gets zero scenery credit, so
-// setting can break ties among good cores but never rescue a bad one.
+// The setting (scenery) bonus. Rather than generic proximity flags, it
+// detects actual features: waterscapes (a proximity ramp plus fjord and
+// inlet excursions plus broad non-frozen open ocean), isthmus geometry,
+// coastal cliffs, isolated river lakes in the valleys, and unusual
+// neighboring biomes (eroded badlands, mushroom fields, flower forest, big
+// cherry groves or old-growth taiga). Each group is capped, and so is the
+// total, and the whole bonus is gated on the core pattern's quality: a
+// weak core gets zero scenery credit, so the setting can break ties among
+// good cores but never rescue a bad one.
 // ---------------------------------------------------------------------------
 struct SettingParts {
     double water = 0.0, isthmus = 0.0, cliffs = 0.0, lakes = 0.0, oddball = 0.0;
@@ -1375,23 +1429,23 @@ static SettingParts setting_parts(const EnrichStats &e, double key) {
 
 double compute_score(int64_t area, int32_t core_cells, const EnrichStats &e) {
 
-    //   score = 2.00 * min(amp, tex, frag, depth, dark)  (pattern quality gate;
-    //                                                     dark = DF at headline)
-    //         + 0.30 * (amp + tex + frag + depth + dark) (tiebreak)
-    //         + 1.10 * extent                            (pattern AT SCALE; now
-    //                                                     includes magic-core
-    //                                                     extent + range size)
-    //         + 1.25 * legacyMean                        (Term-table CONSENSUS:
-    //                                                     weighted mean, not sum)
-    //         - 40 * max(0, bw1664_dark - 0.055)         (DF inside the window)
-    //         - massif tax
-    //         + setting                                  (<= +0.80, core-gated:
-    //                                                     waterscapes, isthmuses,
-    //                                                     cliffs, river lakes,
-    //                                                     oddball biomes; zero if
-    //                                                     the core pattern is weak)
-    // To make size matter more/less, tune the 1.10 extent weight and the
-    // reference/scale constants in score_extent.
+    //   score = 2.00 * min(amp, tex, frag, depth, dark)  the weakest-aspect gate:
+    //                                                    the core pattern's quality
+    //         + 0.30 * (amp + tex + frag + depth + dark) tiebreak across aspects
+    //         + 1.10 * extent                            the pattern at scale
+    //                                                    (see score_extent)
+    //         + 1.25 * consensus                         the fitted Term table
+    //                                                    below, as a weighted MEAN
+    //         - 40 * max(0, bw1664_dark - 0.055)         dark forest inside the
+    //                                                    best window, past ~5.5%
+    //         - massif penalty                           one plateau hogging the
+    //                                                    high ground
+    //         + setting                                  the scenery bonus, up to
+    //                                                    +0.80, core-gated
+    //                                                    (see setting_parts)
+    //
+    // To make raw size matter more or less, tune the 1.10 extent weight and
+    // the reference/scale constants in score_extent.
     double a_amp, a_tex, a_frag, a_depth;
     score_aspects(e, a_amp, a_tex, a_frag, a_depth);
     const double a_dark = score_dark_aspect(e);
@@ -1445,11 +1499,11 @@ double compute_score(int64_t area, int32_t core_cells, const EnrichStats &e) {
         { e.bw896_hmean,  143.39,  13.8513,             +0.43 }, // bw896hMean
         { e.w1664_hstd_max,  46.7241,  3.63239,         +0.41 }, // w1664hStdMax
     };
-    // Weighted MEAN, not a raw sum: with ~39 heavily intercorrelated terms, a
-    // sum pays out ~5x for what is really one underlying quality (ruggedness)
-    // and quietly overrides the min() gate. (The zombie seed's legacy sum was
-    // 63.6 -- +9.5 of its 14.9 total, more than every other term combined.)
-    // The mean is bounded to ~[-2.5, +2.5]: a consensus index, not a pileup.
+    // A weighted mean: the ~39 terms are heavily intercorrelated,
+    // so a sum would pay out several times over for what
+    // is really one underlying quality (ruggedness) and would quietly
+    // override the weakest-aspect gate. As a mean, this term stays bounded
+    // near [-2.5, +2.5]: a consensus index, not a pileup.
     double legacy = 0.0, legacy_wsum = 0.0;
     for (const Term &t : terms) {
         if (!std::isnan(t.v)) {
@@ -1461,26 +1515,26 @@ double compute_score(int64_t area, int32_t core_cells, const EnrichStats &e) {
     }
     if (legacy_wsum > 0.0) legacy /= legacy_wsum;
 
-    // Dark-forest bills: the headline ring and local blotches are handled by
-    // the min() gate via a_dark; this remaining bill covers DF inside the
-    // best pattern window itself (<=5% tolerated).
+    // Dark forest is charged in two places. The weakest-aspect gate
+    // handles the headline ring and the local blotches (via the dark
+    // aspect); the charge here covers dark forest inside the best pattern
+    // window itself, tolerated up to ~5.5%, then billed at 40 per unit of
+    // excess share. The gate's dark aspect still carries the hard veto for
+    // truly infested windows.
     const double dark_win = std::isnan(e.bw1664_dark) ? 0.0 : e.bw1664_dark;
-    // Softened after the 628k-row review: periphery-adjacent DF patches
-    // grazing the pattern window were over-billed at the old -60 slope
-    // (seed 488792975791542062). The min() gate's drk aspect still carries
-    // the hard veto for genuinely DF-infested windows.
     const double dark_pen = 40.0 * std::max(0.0, dark_win - 0.055);
 
-    // OPTIONAL "massif tax" (A/B experiment): a soft bill for one-plateau
-    // blobs whose high ground is a single massif (high_largest > 0.55).
-    // The magic seed's 0.098 never feels it; true plateau blobs do.
+    // The massif penalty: a soft charge for one-plateau regions, where the
+    // largest connected piece of high ground holds more than 55% of all
+    // high ground. The reference region's 0.098 share never triggers it;
+    // true plateau regions do.
     const double massif_pen = 3.0 *
         std::max(0.0, (std::isnan(e.high_largest) ? 0.0 : e.high_largest) - 0.55);
 
-    // "Setting": the unified scenery bonus (replaces the icing + charm pair).
-    // Feature-detected (waterscapes, isthmuses, cliffs, river lakes, oddball
-    // biomes), capped at +0.80, and gated on the core pattern's quality, so
-    // it breaks ties among good cores but never rescues a weak one.
+    // The setting bonus: the scenery around the region, feature-detected
+    // (waterscapes, isthmuses, cliffs, river lakes, unusual neighboring
+    // biomes), capped at +0.80, and gated on the core pattern's quality,
+    // so it breaks ties among good cores but never rescues a weak one.
     const double setting = setting_parts(e, key).total;
 
     return 2.0 * key + 0.30 * (a_amp + a_tex + a_frag + a_depth + a_dark)
@@ -1515,13 +1569,15 @@ static double dark_ring_frac(MeasureCtx &c, int32_t hx, int32_t hz) {
                    : std::numeric_limits<double>::quiet_NaN();
 }
 
-// Outward square-ring scan (~128-block pitch, <= 4800 blocks) around a point.
-// Returns the distance to the nearest 1B-continentalness <= CONT_SHORE point
-// (sees open ocean even outside the blob, which the sublattice mask cannot),
-// and flags two "vicinity oddball" climates along the way: mushroom-island
-// climate (cont <= -1.05) and warm-ocean climate (shore-ish cont AND 0B temp
-// >= 0.55). NaN distance when nothing ocean-ish is in range. RMAX = 4800 to
-// cover the icing taper's full intended reach.
+// An outward square-ring scan (128-block pitch, out to 4,800 blocks)
+// around a point. Returns the distance to the nearest point whose
+// truncated continentalness reads as shore or below; unlike the in-region
+// distance transform, this sees open ocean beyond the region's edge.
+// Along the way it also flags two noteworthy climates: mushroom-island
+// conditions (continentalness <= -1.05) and warm-ocean conditions
+// (shore-like continentalness with truncated temperature >= 0.55). The
+// distance is NaN when nothing ocean-like is in range. The 4,800-block
+// reach covers the farthest distance the scenery bonus still rewards.
 static double ocean_spiral_scan(MeasureCtx &c, int32_t hx, int32_t hz,
                                 double &vic_mush, double &vic_warmoc) {
     constexpr int32_t STEP = 128, RMAX = 4800;
@@ -1557,23 +1613,26 @@ static double ocean_spiral_scan(MeasureCtx &c, int32_t hx, int32_t hz,
 }
 
 // ---------------------------------------------------------------------------
-// Thumbnails v2 (--thumbs): a fixed-scale, fixed-size BMP per measured blob,
-// so a folder sorted by filename IS the ranking, at a constant map scale.
-//   * 64 blocks per pixel (4x the v1 renderer), 256x256 px = 16,384 blocks
-//     across, centered on the headline -- no per-blob rescaling, so relative
-//     blob sizes are directly comparable between images.
-//   * Inside the blob: heightfield re-sampled at 64-block pitch (valley
-//     floors warm, peaks near-white), ocean blue, dark forest dark green.
-//   * Outside the blob: biome-class context colors at 55% brightness -- the
-//     "meta-regional charm" ring. Inland seas, coasts, mushroom fields
-//     (purple), badlands (orange) are visible at a glance.
-//   * Magenta crosshair marks the headline coordinate.
-//   * Filename sort key K = round(score*20 + 1000), zero-padded: higher
-//     score = higher K = later in the folder. (K 1000 = score 0; the magic
-//     seed's 7.68 -> K 1154.)
-// Cost: ~65k getBiomeAt + a few thousand mapApproxHeight per thumbnail
-// (roughly 0.3-0.6 s of one CPU thread) -- trivial for offline triage, a
-// few percent of the verifier pool when enabled on a live search.
+// Thumbnails (--thumbs): a fixed-scale, fixed-size BMP per measured
+// region, so a folder sorted by filename IS the ranking, and every image
+// is at the same map scale.
+//   * 64 blocks per pixel, 256x256 pixels = 16,384 blocks across, centered
+//     on the headline: no per-region rescaling, so relative region sizes
+//     are directly comparable between images.
+//   * Inside the region: the heightfield re-sampled at 64-block pitch
+//     (valley floors warm, peaks near-white), ocean in blue, dark forest
+//     in dark green.
+//   * Outside the region: biome-class context colors at 55% brightness,
+//     so the surroundings (inland seas, coasts, mushroom fields in purple,
+//     badlands in orange) are visible at a glance.
+//   * A magenta crosshair marks the headline coordinate.
+//   * The filename sort key is K = round(score * 20 + 1000), zero-padded:
+//     a higher score sorts later in the folder. K 1000 means score 0; a
+//     score of 8.30 maps to K 1166.
+// Cost: about 65k getBiomeAt calls plus a few thousand mapApproxHeight per
+// thumbnail (roughly 0.3-0.6 s of one CPU thread): trivial for offline
+// triage, a few percent of the verifier pool when enabled on a live
+// search.
 // ---------------------------------------------------------------------------
 static bool g_thumbs_on = false;
 static std::string g_thumbs_dir = "thumbs";
@@ -1598,7 +1657,7 @@ static void ctx_color(int id, uint8_t &r, uint8_t &g, uint8_t &b) {
     case deep_lukewarm_ocean: case warm_ocean: case deep_warm_ocean:
         set(45, 90, 150); break;
     case river: case frozen_river: set(70, 120, 190); break;
-    case mushroom_fields: case mushroom_field_shore: set(190, 90, 190); break; // the oddball you can SEE
+    case mushroom_fields: case mushroom_field_shore: set(190, 90, 190); break;
     case dark_forest: set(30, 70, 35); break;
     case forest: case flower_forest: set(55, 110, 50); break;
     case birch_forest: case old_growth_birch_forest: set(85, 130, 65); break;
@@ -1690,8 +1749,8 @@ static void write_thumb(MeasureCtx &c, const BlobFill &blob,
         }
     }
 
-    // Sortable key: K = score*20 + 1000 (higher score = higher K = later in
-    // the folder). K 1000 = score 0; the magic seed's 7.68 -> K 1154.
+    // The filename sort key: K = score * 20 + 1000, so higher scores sort
+    // later in the folder. K 1000 means score 0.
     int key = std::isnan(score) ? 0 : (int)std::lrint(score * 20.0 + 1000.0);
     key = key < 0 ? 0 : (key > 9999 ? 9999 : key);
     char path[512];
@@ -1712,10 +1771,11 @@ static void write_thumb(MeasureCtx &c, const BlobFill &blob,
 }
 
 // ---------------------------------------------------------------------------
-// The heavy measurement bundle (exported): stride-2 sublattice stats, the
-// 9-bin census, neighbor-pair crossings, windowed best-subregion stats, and
-// the composite score. Runs once per verified seed in cpu.cpp; always runs
-// in --probe mode.
+// The full measurement bundle (exported): the sublattice stats, the 9-bin
+// biome census, neighbor-pair crossings, the windowed best-subregion
+// stats, and the composite score. This is the expensive part of
+// verification, so the verifier runs it once per verified seed after every
+// gate has passed; --probe mode always runs it.
 // ---------------------------------------------------------------------------
 void blob_enrich(MeasureCtx &c, const BlobFill &blob, EnrichStats &o, int phase) {
 
@@ -1738,8 +1798,11 @@ void blob_enrich(MeasureCtx &c, const BlobFill &blob, EnrichStats &o, int phase)
     if (ncells == 0) return;
     o.valid = true;
 
-    // Sublattice membership: cell (i, j) is sampled iff i and j are both
-    // even. Neighbor pairs use offset +2, keeping a uniform 128-block pitch.
+    // A cell joins the measurement when its absolute lattice parity
+    // matches the current phase on both axes (the phase pins which of the
+    // four interleaved grids is measured, independent of which anchor
+    // triggered the fill). Neighbor pairs use offset +2, keeping a uniform
+    // 128-block pitch.
     // Bounding-box-indexed value arrays for pair lookups.
     const int32_t W = blob.maxI - blob.minI + 1;
     const int32_t H = blob.maxJ - blob.minJ + 1;
@@ -1897,15 +1960,15 @@ void blob_enrich(MeasureCtx &c, const BlobFill &blob, EnrichStats &o, int phase)
         if (dh_pairs > 0) o.dh_mean = dh_sum / (double)dh_pairs;
     }
 
-    // --- Peak texture: local height maxima + high-ground connectivity -----
-    // The discriminators between "plateau massif" and "densely packed
-    // individual peaks with dissecting valleys":
-    //   peak_density / peak_prom: strict local maxima on the 128-block
-    //     sublattice (peak strictly above all 4 neighbors, with prominence
-    //     >= PEAK_MIN_PROM to keep ripple noise from registering).
-    //   high_comps / high_largest: component count and largest-component
-    //     share of the y>=200 mask. A massif is ONE component (share ~1.0);
-    //     packed peaks are many small ones.
+    // --- Peak texture: local height maxima and high-ground connectivity ---
+    // These separate "one plateau massif" from "densely packed individual
+    // peaks with dissecting valleys":
+    //   peak_density / peak_prom: strict local maxima on the sublattice (a
+    //     peak must sit above all four neighbors), with a prominence floor
+    //     (PEAK_MIN_PROM) so ripple noise never registers as a peak.
+    //   high_comps / high_largest: the component count and the largest
+    //     component's share of the y >= 200 mask. A massif is one
+    //     component (share near 1.0); packed peaks are many small ones.
     if (n > 0 && !h_vals.empty()) {
         constexpr double PEAK_MIN_PROM = 8.0; // blocks; tunable
         int64_t peaks = 0;
@@ -2114,9 +2177,9 @@ void blob_enrich(MeasureCtx &c, const BlobFill &blob, EnrichStats &o, int phase)
         if (!std::isnan(o.bw1664_sc))     { hx = o.bw1664_x; hz = o.bw1664_z; }
         else if (!std::isnan(o.bw896_sc)) { hx = o.bw896_x;  hz = o.bw896_z; }
 
-        // Dark forest around the headline (redefined darkCoreFrac). Unlike
-        // the blob-mask stats, this sees dark forest sitting just OFF the
-        // blob -- the zombie seed's two blobs lived in exactly that blind spot.
+        // Dark forest around the headline (darkCoreFrac). Unlike the
+        // blob-mask stats, this ring also sees dark forest sitting just
+        // outside the region, which the masked census cannot.
         o.dark_core_frac = dark_ring_frac(c, hx, hz);
 
         // Open ocean beyond the blob edge (ocean inside the blob is covered
@@ -2173,7 +2236,7 @@ void blob_enrich_best(MeasureCtx &c, const BlobFill &blob, EnrichStats &o, int p
 namespace {
 
 // ---------------------------------------------------------------------------
-// Probe-only: blob-field means over ALL cells + coastal-erosion stat.
+// Probe-only: blob-field means over all cells + coastal-erosion stat.
 // (Cheap extras the prober prints but the verifier's score doesn't need.)
 // ---------------------------------------------------------------------------
 void blob_field_stats(MeasureCtx &c, const VerifyConfig &, const BlobFill &blob,

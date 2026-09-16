@@ -21,12 +21,13 @@
 //   (plus the many enrichment/stat columns; the output file's own header
 //   comment carries the full, always-current column list)
 //
-// The score is the prober's composite rank, computed natively by the CPU
-// verifier (blob_enrich over the same flood fill the gates used) -- the old
-// two-step search-then-rank workflow is no longer needed. (x, z) is the
-// headline coordinate: the center of the blob's best-pattern
-// 1664x1664-block window (the heart of the densest-packed peaks); anchorX/Z
-// is the original pipeline hit point. Sort by column 1 DESCENDING.
+// The score is the composite rank from probe.cpp, computed by the CPU
+// verifier itself (blob_enrich over the same flood fill the gates used), so
+// searching and ranking happen in one pass. The (x, z) pair is the headline
+// coordinate: the center of the region's best-pattern 1,664x1,664-block
+// window, the heart of the densest-packed peaks. anchorX/anchorZ is the
+// point where the pipeline first detected the region. Sort by column 1
+// descending to rank.
 
 #include <cstdint>
 #include <cstdio>
@@ -92,7 +93,9 @@ std::atomic_bool g_running{true};
 static double g_min_score = -std::numeric_limits<double>::infinity();
 static std::atomic_uint32_t g_signal_count{0};
 
-// Signal handler to catch Ctrl+C for a clean exit.
+// The Ctrl+C handler: one press starts a graceful shutdown (the worker
+// threads finish in-flight work, then the final stats line prints), a
+// second press force-exits immediately.
 static void signal_handler(int) {
     const uint32_t count = g_signal_count.fetch_add(1, std::memory_order_relaxed) + 1;
     g_running.store(false, std::memory_order_relaxed);
@@ -115,12 +118,12 @@ static void signal_handler(int) {
 }
 
 // ---------------------------------------------------------------------------
-// Console UI: verbosity levels + live status line.
+// Console UI: verbosity levels plus a live status line.
 //
-// The status line is a curl-style carriage-return rewrite ("\r" + overwrite):
-// no ANSI escapes, no curses, no dependencies -- it works on any terminal
-// (including legacy cmd.exe), and degrades to plain 5-second progress lines
-// when stdout is redirected to a file or pipe.
+// The status line rewrites itself in place with a carriage return ("\r" +
+// overwrite): no ANSI escapes, no curses, no dependencies, so it works on
+// any terminal (including legacy cmd.exe), and it degrades to plain
+// 5-second progress lines when stdout is redirected to a file or pipe.
 // ---------------------------------------------------------------------------
 std::atomic_int g_ui_level{UI_NORMAL};
 
@@ -195,12 +198,12 @@ static bool parse_i64(const char *s, int64_t &out) {
     return res.ec == std::errc() && res.ptr == end;
 }
 
-// Row tokenization used to locate seed/x/z inside a row. Output rows may lead
-// with a decimal score column (new output format), so the seed is found as
-// the first integer-like token (a score always contains a '.', so it can
-// never be mistaken for a seed). This accepts both the new score-first rows
-// and the older seed-first format transparently -- everywhere: --seeds,
-// --verify, and the dedup preload all use these helpers.
+// Row tokenization used to locate the seed/x/z inside a row. Output rows
+// lead with a decimal score column, so the seed is found as the first
+// integer-like token (a score always prints with a decimal point, so it can
+// never be mistaken for a seed). Both row layouts parse identically: the
+// current score-first rows and the earlier seed-first ones. --seeds,
+// --verify, and the dedup preload all build on these helpers.
 struct RowTok { const char *p; int len; };
 
 static int row_tokenize(const char *line, RowTok *toks, int maxtoks) {
@@ -233,8 +236,8 @@ static bool row_tok_i64(const RowTok &t, int64_t &v) {
 }
 
 // Seed list file: the first integer-like token of each line is the seed; the
-// rest of the line is ignored, so a previous output.txt (old or new format)
-// can be fed back in.
+// rest of the line is ignored, so a previous output.txt in either row
+// format can be fed straight back in.
 static bool load_seed_list(const char *path, std::vector<uint64_t> &out) {
     std::FILE *fp = std::fopen(path, "r");
     if (!fp) return false;
@@ -255,17 +258,19 @@ static bool load_seed_list(const char *path, std::vector<uint64_t> &out) {
 }
 
 // Verify list file: "seed x z" per line, located as the first run of three
-// integer-like tokens ('#' comments and blanks skipped). Accepts both the old
-// (seed-first) and new (score-first) output formats.
+// integer-like tokens ('#' comments and blank lines skipped). Both output
+// formats parse: the current score-first rows and the earlier seed-first
+// ones.
 //
 // When the file carries a "# score seed ..." header with anchorX/anchorZ
-// columns, the anchor coordinates are preferred over the headline x/z: the
-// live pipeline always evaluates its gates (dark forest, height spiral, blob
-// fill seed) at the anchor, so verifying at the anchor reproduces the
-// original verdict exactly. The headline x/z is a display coordinate (the
-// best-pattern window center) and can sit closer to peripheral features --
-// e.g. a dark-forest patch that the anchor-centered gate never saw. The
-// enrichment recomputes the headline coords anyway, so nothing is lost.
+// columns, the anchor coordinates win over the headline x/z. The live
+// pipeline evaluates its gates (dark forest, height spiral, blob-fill seed)
+// at the anchor, so verifying at the anchor reproduces the original verdict
+// exactly. The headline x/z is a display coordinate (the best-pattern
+// window's center) and can sit closer to peripheral features than the
+// anchor did, such as a dark-forest patch the anchor-centered gate never
+// saw. The enrichment recomputes the headline coordinates anyway, so
+// nothing is lost.
 static bool load_verify_list(const char *path, std::vector<GpuOutput> &out) {
     std::FILE *fp = std::fopen(path, "r");
     if (!fp) return false;
@@ -332,12 +337,12 @@ static bool load_verify_list(const char *path, std::vector<GpuOutput> &out) {
     return true;
 }
 
-// Dedup-preload parser: like load_verify_list, but keys on the trailing
+// Dedup-preload parser: like load_verify_list, but keyed on the trailing
 // anchorX/anchorZ of current-format output rows. The pipeline re-emits at
-// anchor coordinates on resume, so anchoring the preload at the same points
-// keeps the full dedup radius effective. (Only correct for the current
-// score-first output format; old-format rows would misread the trailing
-// blobArea/coreRadius as coordinates.)
+// anchor coordinates on resume, so preloading anchors (rather than headline
+// coordinates) keeps the full dedup radius effective. (Only correct for the
+// current score-first format; an earlier seed-first row would misread its
+// trailing integer columns as coordinates.)
 static int preload_seed_col = -1, preload_ax_col = -1, preload_az_col = -1;
 
 static bool load_preload_list(const char *path, std::vector<GpuOutput> &out) {
@@ -416,13 +421,14 @@ static bool row_tok_f64(const RowTok &t, double &v) {
     return true;
 }
 
-// Parses one output/probe row. The seed/x/z run anchors the row; the layouts
-// are told apart by the shape of the integer run after the headline z:
-//   new search rows:  score seed x z AREA CORE maxY <decimal eroCov> ...  (3+ ints after z)
-//   probe rows:       seed x z AREA CORE coreBlocks edge nCells ...       (3+ ints after z)
-//   old search rows:  score seed x z maxY <decimal eroCov> ... AREA CORE edge  (1 int after z)
+// Parses one output or probe row. The seed/x/z run anchors the row; the
+// layouts are told apart by the shape of the integer run after the
+// headline z:
+//   current search rows:  score seed x z AREA CORE maxY <decimal eroCov> ...   (3+ ints after z)
+//   probe rows:           seed x z AREA CORE coreBlocks edge nCells ...        (3+ ints after z)
+//   earlier search rows:  score seed x z maxY <decimal eroCov> ... AREA CORE   (1 int after z)
 // The score is the decimal token right before the seed (search rows), or the
-// trailing decimal token (probe rows print the score last).
+// trailing decimal token (probe rows print it last).
 static bool parse_output_row(const char *line, ListRow &out) {
     RowTok tok[128]; // probe rows run to ~74 tokens
     const int nt = row_tokenize(line, tok, 128);
@@ -781,15 +787,16 @@ static uint64_t random_start_seed() {
     return ((uint64_t)rd() << 32) + (uint64_t)rd();
 }
 
-// Field printers: NaN doubles print as -999.99 (the prober's sentinel
-// convention), so partially measured rows stay machine-parseable.
+// Field printer: NaN doubles print as -999.99 (the not-measured sentinel),
+// so partially measured rows stay machine-parseable.
 static void fd(std::FILE *fp, double v) {
     if (std::isnan(v)) std::fprintf(fp, " -999.99");
     else               std::fprintf(fp, " %.4f", v);
 }
 
-// Console + file reporting for one verified candidate (shared by both modes).
-// `index` is the 1-based running count of printed rows (shown as [#N]).
+// Console and file reporting for one verified candidate (shared by both
+// modes). `index` is the 1-based running count of printed rows, shown as
+// [#N] on the console.
 static void print_cpu_output(std::FILE *out_fp, const CpuOutput &o, uint64_t index) {
     const EnrichStats &s = o.stats;
 
@@ -801,9 +808,10 @@ static void print_cpu_output(std::FILE *out_fp, const CpuOutput &o, uint64_t ind
     else                     std::snprintf(scorebuf, sizeof(scorebuf), "%.2f", o.score);
 
     if (g_ui_level.load(std::memory_order_relaxed) < UI_VERBOSE) {
-        // Compact one-liner; the full stat vector is on the file row below.
-        // Coordinates are the headline (best-pattern window center -- the
-        // point you actually teleport to); the anchor is in the file row.
+        // The compact one-liner; the full stat vector is on the file row
+        // below. The coordinates printed here are the headline (the
+        // best-pattern window's center, the point worth teleporting to);
+        // the anchor stays in the file row.
         ui_eventf("[#%" PRIu64 "] seed %" PRIi64 " @ (%" PRIi32 ", %" PRIi32 ")"
                   " | score %s | blob %.2fM | core %" PRIi32 " | maxY %" PRIi32 "%s",
                   index, (int64_t)o.seed, o.x, o.z, scorebuf,
@@ -908,9 +916,10 @@ static void print_cpu_output(std::FILE *out_fp, const CpuOutput &o, uint64_t ind
     fd(out_fp, s.chy_comp_m);
     fd(out_fp, s.setting);
     std::fprintf(out_fp, "\n");
-    // Flush every verified row: at ~1 row per 4M seeds, the stdio buffer could
-    // otherwise sit on minutes of finds, and a crash would silently lose them.
-    // One fflush at these rates costs nothing.
+    // Flush every verified row: rows are rare enough (around one per several
+    // million seeds) that a buffered row could sit in memory for minutes,
+    // and a crash would silently lose it. One fflush per row costs nothing
+    // at these rates.
     std::fflush(out_fp);
 }
 
@@ -998,9 +1007,9 @@ int main(int argc, char **argv) {
     }
     g_min_score = args.min_score;
 
-    // --list-seeds: pure utility mode. Parse an output/probe file, keep the
-    // best row per seed under the sort key, print the seeds in sorted order,
-    // and exit -- before the GPU/output plumbing is touched.
+    // --list-seeds: a standalone utility mode. Parse an output/probe file,
+    // keep the best row per seed under the sort key, print the seeds in
+    // sorted order, and exit, before any GPU or output plumbing is touched.
     if (args.list_seeds_file) {
         std::vector<ListRow> rows;
         if (!load_output_rows(args.list_seeds_file->c_str(), rows)) {
@@ -1226,21 +1235,25 @@ int main(int argc, char **argv) {
     }
 
     // ------------------------------------------------------------------
-    // Best-of-seed aggregation (search / --seeds modes).
+    // Best-of-seed aggregation (search and --seeds modes).
     //
-    // Every GPU candidate for a seed is emitted by one GPU batch, so all of
-    // a seed's verified rows arrive within a second or two of each other.
-    // But which anchor claimed the old dedup map first was a thread race,
-    // and the blob-fill lattice is phased by the candidate point -- so the
-    // same seed genuinely scores differently per anchor (the magic seed has
-    // produced both a -5.9 row and a +7.3 row!). Instead of first-claim-wins,
-    // hold verified rows briefly, cluster each seed's rows by anchor
-    // proximity (dedup radius, chain-linked), and print the best-scoring row
-    // per cluster. CPU cost is unchanged: the dropped candidates were
-    // already fully verified before the old dedup discarded them.
-    // Rows are flushed once their seed has been quiet for AGGREGATE_FLUSH_AGE_S
-    // seconds (and unconditionally at list completion / shutdown), so output
-    // rows lag verification by a few seconds -- purely cosmetic.
+    // The GPU emits every candidate for a seed within one batch, so all of a
+    // seed's verified rows arrive within a second or two of each other.
+    // Which anchor wins still matters, though: the blob fill's measurement
+    // lattice is phased by the candidate point, so the same seed can
+    // genuinely score differently per anchor (one known-good region has
+    // produced both a -5.9 row and a +7.3 row from different anchors).
+    // Rather than letting whichever verifier thread finishes first claim
+    // the seed, verified rows are held briefly, clustered by anchor
+    // proximity (chain-linked at the dedup radius), and only the
+    // best-scoring row of each cluster is printed. CPU cost is unchanged
+    // either way: the runner-up candidates were already fully verified by
+    // the time they are dropped.
+    //
+    // Rows are flushed once their seed has been quiet for
+    // AGGREGATE_FLUSH_AGE_S seconds, and unconditionally at list completion
+    // or shutdown. Output rows therefore lag verification by a few seconds,
+    // which is cosmetic only.
     // ------------------------------------------------------------------
     const bool aggregate = vcfg.aggregate;
     constexpr double AGGREGATE_FLUSH_AGE_S = 3.0;
@@ -1248,6 +1261,9 @@ int main(int argc, char **argv) {
         CpuOutput row;
         std::chrono::steady_clock::time_point t;
     };
+    // pending holds rows keyed by seed until they flush; pending_order tracks
+    // (first-seen time, seed) pairs in arrival order, so flush_pending can
+    // age out the oldest seeds first.
     std::unordered_map<uint64_t, std::vector<PendingRow>> pending;
     std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> pending_order;
 
@@ -1260,7 +1276,8 @@ int main(int argc, char **argv) {
         const std::vector<PendingRow> &rows = it->second;
         const int64_t r2 = (int64_t)vcfg.dedup_radius * vcfg.dedup_radius;
 
-        // Chain-cluster rows whose ANCHORS lie within the dedup radius.
+        // Cluster rows by anchor proximity: a row joins a cluster if its
+        // anchor lies within the dedup radius of any member's anchor.
         std::vector<int32_t> cl(rows.size(), -1);
         int32_t ncl = 0;
         for (size_t i = 0; i < rows.size(); i++) {
@@ -1282,8 +1299,8 @@ int main(int argc, char **argv) {
             }
             ncl++;
         }
-        // Keep the best-scoring row per cluster. (NaN scores, possible with
-        // --no-blob, never win the comparison, so the first row stands.)
+        // Keep the best-scoring row per cluster. NaN scores (possible under
+        // --no-blob) never win the comparison, so the first row stands.
         for (int32_t c2 = 0; c2 < ncl; c2++) {
             size_t best = (size_t)-1;
             for (size_t i = 0; i < rows.size(); i++)
@@ -1354,11 +1371,13 @@ int main(int argc, char **argv) {
     uint64_t prog_last = 0;
     double rate_smooth = 0.0;
 
-    // Live status line on a TTY (curl-style \r rewrite; --verbose opts out
-    // because the firehose owns the screen); a plain progress line every
-    // 5 s when stdout is a log file.
+    // A live status line on a TTY (a carriage-return rewrite; --verbose opts
+    // out because the full reject log owns the screen there), or a plain
+    // progress line every 5 seconds when stdout is a log file.
     const bool live_status = g_ui_tty && g_ui_level.load(std::memory_order_relaxed) < UI_VERBOSE;
 
+    // Status line legend: the reject tallies read as 
+    // rej a/c/d/h = area gate, core gate, dark forest, height.
     auto build_status = [&]() -> std::string {
         const double el = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_start).count();
