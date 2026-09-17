@@ -661,7 +661,7 @@ Yes. Press Ctrl+C once and wait for the graceful shutdown; the final line tells 
 <details>
 <summary id="how-to-consolidate-seedlists"><b>Can I run two searches at once?</b></summary>
 
-Sure, but give each one its own `--output` file; two processes appending to the same file can tangle a row mid-line. Merge them later by dragging them into `seedlists/`, opening up a terminal in that directory, and running `python3 consolidate_seedlists.py . -o combined.txt`.
+Sure, but give each one its own `--output` file; two processes appending to the same file can tangle a row mid-line. You can merge them later manually, or, if you want to merge just the plain seeds into a barebones seedlist, drag your files into `seedlists/`, open up a terminal in that directory, and run `python3 consolidate_seedlists.py . -o seed_atlas.txt --first-seen`.
 </details>
 
 <dl></dl>
